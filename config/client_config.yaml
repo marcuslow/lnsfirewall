@@ -1,0 +1,37 @@
+# pfSense Client Configuration
+# Copy this file to /usr/local/etc/pfsense_client.yaml on your pfSense firewall
+
+# HQ Server connection settings (HTTP/HTTPS)
+hq_url: "https://lnsfirewall.ngrok.app"  # Your ngrok public URL via HTTPS (ngrok)
+reconnect_interval: 10  # Seconds between polls
+
+# Client identification (optional - will be auto-generated if not provided)
+# client_id: "firewall-001"
+client_name: "opus-1"  # Friendly name for this firewall (e.g., "opus-1", "branch-office-2", "main-firewall")
+
+# Logging configuration
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+log_file: "/var/log/pfsense_client.log"
+max_log_size: "10MB"
+log_retention_days: 30
+
+# Security settings (HTTPS handled by ngrok)
+ssl_verify: true   # Verify SSL certificates
+api_key: ""        # Optional API key for authentication
+
+# Firewall specific settings
+pfsense_config_path: "/cf/conf/config.xml"
+backup_retention_days: 7
+max_log_collection_days: 90
+
+# System monitoring
+heartbeat_interval: 30  # Seconds between heartbeat messages
+status_update_interval: 300  # Seconds between status updates
+
+# Command execution limits
+max_concurrent_commands: 3
+command_timeout: 300  # Seconds
+
+# Network settings
+connection_timeout: 30  # Seconds
+read_timeout: 60       # Seconds

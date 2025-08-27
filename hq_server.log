@@ -1,0 +1,203 @@
+2025-08-27 10:22:00,569 - __main__ - INFO - Starting HQ server on 0.0.0.0:8000
+2025-08-27 10:22:00,665 - websockets.server - INFO - server listening on 0.0.0.0:8000
+2025-08-27 10:22:00,666 - __main__ - INFO - HQ server started successfully
+2025-08-27 10:25:33,095 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:25:33,101 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:25:34,566 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:25:34,568 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:25:48,303 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:25:48,305 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:26:31,482 - websockets.server - INFO - connection open
+2025-08-27 10:26:31,483 - websockets.server - ERROR - connection handler failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 376, in conn_handler
+    await self.handler(connection)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: HQServer.client_handler() missing 1 required positional argument: 'path'
+2025-08-27 10:27:37,363 - websockets.server - INFO - server closing
+2025-08-27 10:27:37,364 - websockets.server - INFO - server closed
+2025-08-27 10:27:43,492 - __main__ - INFO - Starting HQ server on 0.0.0.0:8000
+2025-08-27 10:27:43,530 - websockets.server - INFO - server listening on 0.0.0.0:8000
+2025-08-27 10:27:43,531 - __main__ - INFO - HQ server started successfully
+2025-08-27 10:27:57,932 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:27:57,935 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:27:58,197 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:27:58,201 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:28:05,241 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:28:05,252 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:28:41,559 - websockets.server - INFO - connection open
+2025-08-27 10:28:41,559 - websockets.server - ERROR - connection handler failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 376, in conn_handler
+    await self.handler(connection)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: HQServer.client_handler() missing 1 required positional argument: 'path'
+2025-08-27 10:30:41,976 - websockets.server - INFO - server closing
+2025-08-27 10:30:41,976 - websockets.server - INFO - server closed
+2025-08-27 10:30:49,497 - __main__ - INFO - Starting HQ server on 0.0.0.0:8000
+2025-08-27 10:30:49,533 - websockets.server - INFO - server listening on 0.0.0.0:8000
+2025-08-27 10:30:49,535 - __main__ - INFO - HQ server started successfully
+2025-08-27 10:31:20,563 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:31:20,571 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:31:20,842 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:31:20,844 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:31:32,428 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:31:32,431 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:31:35,576 - websockets.server - INFO - connection open
+2025-08-27 10:31:35,577 - websockets.server - ERROR - connection handler failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 376, in conn_handler
+    await self.handler(connection)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: HQServer.start_server.<locals>.websocket_handler() missing 1 required positional argument: 'path'
+2025-08-27 10:34:57,629 - websockets.server - INFO - server closing
+2025-08-27 10:34:57,630 - websockets.server - INFO - server closed
+2025-08-27 10:36:09,595 - __main__ - INFO - Starting HQ server on 0.0.0.0:8000
+2025-08-27 10:36:09,632 - websockets.server - INFO - server listening on 0.0.0.0:8000
+2025-08-27 10:36:09,633 - __main__ - INFO - HQ server started successfully
+2025-08-27 10:36:21,846 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:36:21,854 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:36:22,096 - websockets.server - INFO - connection rejected (426 Upgrade Required)
+2025-08-27 10:36:22,112 - websockets.server - ERROR - opening handshake failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 138, in accept
+    ) = self.process_request(request)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\server.py", line 233, in process_request
+    raise InvalidUpgrade(
+websockets.exceptions.InvalidUpgrade: invalid Connection header: keep-alive
+2025-08-27 10:37:14,150 - websockets.server - INFO - connection open
+2025-08-27 10:37:14,151 - websockets.server - ERROR - connection handler failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 376, in conn_handler
+    await self.handler(connection)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: HQServer.start_server.<locals>.websocket_handler() missing 1 required positional argument: 'path'
+2025-08-27 10:39:44,422 - websockets.server - INFO - server closing
+2025-08-27 10:39:44,423 - websockets.server - INFO - server closed
+2025-08-27 10:39:51,489 - __main__ - INFO - Starting HQ server on 0.0.0.0:8000
+2025-08-27 10:39:51,539 - websockets.server - INFO - server listening on 0.0.0.0:8000
+2025-08-27 10:39:51,540 - __main__ - INFO - HQ server started successfully
+2025-08-27 10:39:56,287 - websockets.server - INFO - connection open
+2025-08-27 10:39:56,287 - websockets.server - ERROR - connection handler failed
+Traceback (most recent call last):
+  File "C:\Users\godju\AppData\Local\Programs\Python\Python311\Lib\site-packages\websockets\asyncio\server.py", line 376, in conn_handler
+    await self.handler(connection)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: HQServer.client_handler() missing 1 required positional argument: 'path'
+2025-08-27 10:55:39,527 - websockets.server - INFO - server closing
+2025-08-27 10:55:39,529 - websockets.server - INFO - server closed

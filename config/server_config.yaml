@@ -1,0 +1,44 @@
+# HQ Server Configuration
+
+# Server settings
+host: "0.0.0.0"  # Listen on all interfaces
+port: 8000
+max_connections: 100
+
+# Database settings
+database_path: "hq_database.db"
+backup_database: true
+backup_interval_hours: 24
+
+# Security settings
+enable_ssl: false
+ssl_cert_path: ""
+ssl_key_path: ""
+require_api_key: false
+api_keys: []  # List of valid API keys
+
+# Client management
+client_timeout_seconds: 120  # Consider client dead after this time
+cleanup_interval_seconds: 60  # How often to check for dead clients
+max_log_storage_days: 365    # How long to keep logs in database
+
+# Logging
+log_level: "INFO"
+log_file: "hq_server.log"
+max_log_size: "50MB"
+log_retention_days: 30
+
+# OpenAI settings (for AI Command Center)
+openai_api_key: ""  # Set your OpenAI API key here
+openai_model: "gpt-4"
+max_conversation_history: 20
+
+# Performance settings
+max_concurrent_commands: 50
+command_timeout_seconds: 300
+max_log_size_mb: 100  # Maximum size for log collection
+
+# Monitoring and alerts
+enable_monitoring: true
+alert_on_client_disconnect: true
+alert_email: ""  # Email for alerts (if configured)
