@@ -13,13 +13,37 @@ if [ "$uname_out" != "FreeBSD" ]; then
   echo "⚠️  This script is intended for pfSense/FreeBSD. Continuing anyway..."
 fi
 
-# Packages
-echo "📦 Installing packages: python39 py39-pip"
-pkg install -y python39 py39-pip || true
+# Pick the best available Python (prefer 3.11, then 3.10, 3.9), and ensure matching pip + psutil
+if command -v python3.11 >/dev/null 2>&1; then
+  PYTHON_CMD=python3.11; PYVER=311
+elif command -v python3.10 >/dev/null 2>&1; then
+  PYTHON_CMD=python3.10; PYVER=310
+elif command -v python3.9 >/dev/null 2>&1; then
+  PYTHON_CMD=python3.9; PYVER=39
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_CMD=python3; PYVER=$(${PYTHON_CMD} -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo "39")
+else
+  echo "📦 Installing Python via pkg (python39 + py39-pip)"
+  pkg install -y python39 py39-pip || true
+  PYTHON_CMD=python3.9; PYVER=39
+fi
 
-# Python deps
-echo "📦 Installing Python deps: requests pyyaml psutil"
-pip install --no-cache-dir requests pyyaml psutil
+echo "🐍 Using Python interpreter: ${PYTHON_CMD} (py${PYVER})"
+
+# Ensure pip for this interpreter
+if ! ${PYTHON_CMD} -m pip --version >/dev/null 2>&1; then
+  echo "📦 Installing pip for py${PYVER}"
+  pkg install -y "py${PYVER}-pip" || true
+fi
+
+# Install psutil via pkg to avoid wheel mismatch on FreeBSD
+echo "📦 Installing psutil package: py${PYVER}-psutil"
+pkg install -y "py${PYVER}-psutil" || pkg install -y py39-psutil || true
+
+# Python deps via pip (requests, pyyaml) using the same interpreter
+echo "📦 Installing Python deps via pip: requests pyyaml"
+${PYTHON_CMD} -m pip install --no-cache-dir --upgrade pip || true
+${PYTHON_CMD} -m pip install --no-cache-dir requests pyyaml
 
 # Paths
 mkdir -p /usr/local/bin /usr/local/etc /var/log
@@ -42,6 +66,7 @@ if [ ! -f /usr/local/etc/pfsense_client.yaml ]; then
 hq_url: "https://lnsfirewall.ngrok.app"
 client_name: "opus-1"
 reconnect_interval: 10
+idle_poll_interval: 1
 EOF
   fi
 else
@@ -56,9 +81,9 @@ if [ -z "$HQ_URL" ]; then
 fi
 fetch -qo - "$HQ_URL/status" || true
 
-# Test run
-echo "▶️  Running client once (Ctrl+C to stop)"
+# Test run (foreground). To run in background after logout, set up the service or use daemon(8).
+echo "▶️  Running client once (Ctrl+C to stop). To keep it running after logout: sh setup_client.sh, then 'service pfsense_client start'"
 python3 /usr/local/bin/pfsense_client.py --config /usr/local/etc/pfsense_client.yaml || true
 
-echo "✅ Install complete. To run on boot, consider creating a service script."
+echo "✅ Install complete. To run on boot, use: sh setup_client.sh && service pfsense_client start"
 

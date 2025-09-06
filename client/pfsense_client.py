@@ -11,7 +11,6 @@ import os
 import sys
 import time
 import subprocess
-import psutil
 import yaml
 import requests
 from datetime import datetime, timedelta
@@ -21,6 +20,12 @@ import hashlib
 import gzip
 import shutil
 from glob import glob
+
+try:
+    import psutil
+except ImportError:
+    import psutil_stub as psutil
+
 
 # Configure logging
 logging.basicConfig(
