@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # pfSense Client Setup Script
 # Run this script on your pfSense firewall
 
@@ -11,13 +11,38 @@ if [ "$(uname)" != "FreeBSD" ]; then
     echo "⚠️  This script is designed for pfSense (FreeBSD). Proceeding anyway..."
 fi
 
-# Install required packages
-echo "📦 Installing required packages..."
-pkg install -y python39 py39-pip
+# Select best available Python and matching pip/psutil (no pip psutil build)
+echo "📦 Checking Python interpreters..."
+if command -v python3.11 >/dev/null 2>&1; then
+  PYTHON_CMD=python3.11; PYVER=311
+elif command -v python3.10 >/dev/null 2>&1; then
+  PYTHON_CMD=python3.10; PYVER=310
+elif command -v python3.9 >/dev/null 2>&1; then
+  PYTHON_CMD=python3.9; PYVER=39
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_CMD=python3; PYVER=$(${PYTHON_CMD} -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo 39)
+else
+  echo "📦 Installing Python via pkg (python39 + py39-pip)"
+  pkg install -y python39 py39-pip || true
+  PYTHON_CMD=python3.9; PYVER=39
+fi
 
-# Install Python dependencies
-echo "📦 Installing Python dependencies..."
-pip install requests pyyaml psutil
+echo "🐍 Using Python interpreter: ${PYTHON_CMD} (py${PYVER})"
+
+# Ensure pip for this interpreter
+if ! ${PYTHON_CMD} -m pip --version >/dev/null 2>&1; then
+  echo "📦 Installing pip for py${PYVER}"
+  pkg install -y "py${PYVER}-pip" || true
+fi
+
+# Install psutil via pkg only (avoid building from source)
+echo "📦 Installing psutil via pkg: py${PYVER}-psutil (if available)"
+pkg install -y "py${PYVER}-psutil" || true
+
+# Install pure-Python deps via pip
+echo "📦 Installing Python deps via pip: requests pyyaml"
+${PYTHON_CMD} -m pip install --no-cache-dir --upgrade pip || true
+${PYTHON_CMD} -m pip install --no-cache-dir requests pyyaml
 
 # Create directories
 mkdir -p /usr/local/bin
@@ -33,7 +58,7 @@ chmod +x /usr/local/bin/pfsense_client.py
 echo "📋 Installing configuration..."
 if [ ! -f /usr/local/etc/pfsense_client.yaml ]; then
     cp config/client_config.yaml /usr/local/etc/pfsense_client.yaml
-    echo "⚠️  Please edit /usr/local/etc/pfsense_client.yaml with your HQ server URL"
+    echo "⚠️  Please edit /usr/local/etc/pfsense_client.yaml with your HQ server URL (hq_url) and client_name"
 else
     echo "✅ Configuration file already exists"
 fi
