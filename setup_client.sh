@@ -35,9 +35,8 @@ if ! ${PYTHON_CMD} -m pip --version >/dev/null 2>&1; then
   pkg install -y "py${PYVER}-pip" || true
 fi
 
-# Install psutil via pkg only (avoid building from source)
-echo "📦 Installing psutil via pkg: py${PYVER}-psutil (if available)"
-pkg install -y "py${PYVER}-psutil" || true
+# psutil is optional; the client includes a FreeBSD-friendly psutil_stub and will run without psutil.
+# If you later want native psutil, install it manually via: pkg install py${PYVER}-psutil
 
 # Install pure-Python deps via pip
 echo "📦 Installing Python deps via pip: requests pyyaml"
