@@ -11,7 +11,7 @@ if [ "$(uname)" != "FreeBSD" ]; then
     echo "⚠️  This script is designed for pfSense (FreeBSD). Proceeding anyway..."
 fi
 
-# Select best available Python and matching pip/psutil (no pip psutil build)
+# Select best available Python and matching pip (psutil is optional; no pip psutil build)
 echo "📦 Checking Python interpreters..."
 if command -v python3.11 >/dev/null 2>&1; then
   PYTHON_CMD=python3.11; PYVER=311
@@ -48,10 +48,14 @@ mkdir -p /usr/local/bin
 mkdir -p /usr/local/etc
 mkdir -p /var/log
 
-# Copy client script
-echo "📋 Installing client script..."
+# Copy client script and psutil_stub so fallback import works
+echo "📋 Installing client script and psutil_stub..."
 cp client/pfsense_client.py /usr/local/bin/
 chmod +x /usr/local/bin/pfsense_client.py
+if [ -f client/psutil_stub.py ]; then
+  cp client/psutil_stub.py /usr/local/bin/psutil_stub.py
+  chmod 644 /usr/local/bin/psutil_stub.py
+fi
 
 # Copy configuration
 echo "📋 Installing configuration..."
