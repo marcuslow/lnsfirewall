@@ -36,9 +36,8 @@ if ! ${PYTHON_CMD} -m pip --version >/dev/null 2>&1; then
   pkg install -y "py${PYVER}-pip" || true
 fi
 
-# Install psutil via pkg to avoid wheel mismatch on FreeBSD
-echo "📦 Installing psutil package: py${PYVER}-psutil"
-pkg install -y "py${PYVER}-psutil" || pkg install -y py39-psutil || true
+# psutil is optional (we include psutil_stub). If you want native psutil later:
+# pkg install -y "py${PYVER}-psutil"
 
 # Python deps via pip (requests, pyyaml) using the same interpreter
 echo "📦 Installing Python deps via pip: requests pyyaml"
@@ -48,11 +47,19 @@ ${PYTHON_CMD} -m pip install --no-cache-dir requests pyyaml
 # Paths
 mkdir -p /usr/local/bin /usr/local/etc /var/log
 
-# Copy client script if present adjacent; otherwise, assume already placed
+# Copy client script and stub if present adjacent; otherwise, assume already placed
 if [ -f client/pfsense_client.py ]; then
   echo "📋 Installing client script to /usr/local/bin/pfsense_client.py"
   cp client/pfsense_client.py /usr/local/bin/pfsense_client.py
   chmod +x /usr/local/bin/pfsense_client.py
+  # Ensure psutil_stub is co-located so 'import psutil_stub' works when real psutil is missing
+  if [ -f client/psutil_stub.py ]; then
+    echo "📋 Installing psutil_stub to /usr/local/bin/psutil_stub.py"
+    cp client/psutil_stub.py /usr/local/bin/psutil_stub.py
+    chmod 644 /usr/local/bin/psutil_stub.py
+  else
+    echo "ℹ️  client/psutil_stub.py not found next to pfsense_client.py; skipping"
+  fi
 fi
 
 # Config
