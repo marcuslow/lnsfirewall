@@ -1,0 +1,38 @@
+# ngrok Configuration File
+# Place this in your user directory or specify with --config flag
+
+version: "2"
+authtoken: YOUR_NGROK_AUTH_TOKEN  # Get from https://dashboard.ngrok.com/get-started/your-authtoken
+
+tunnels:
+  lnsfirewall:
+    proto: http
+    addr: 8000
+    domain: lnsfirewall.ngrok.app
+    # Traffic policies to optimize usage
+    traffic_policy:
+      # Allow requests but limit based on data volume
+      inbound:
+        - name: "rate_limit_by_size"
+          expressions:
+            - "req.raw_body_size > 1048576"  # 1MB limit per request
+          actions:
+            - type: "deny"
+              config:
+                status_code: 413
+                message: "Request too large"
+        
+        # Allow small requests (like your client registration)
+        - name: "allow_small_requests"
+          expressions:
+            - "req.raw_body_size <= 1048576"  # Allow requests under 1MB
+          actions:
+            - type: "allow"
+
+# Regional settings (optional)
+region: us  # or eu, ap, au, sa, jp, in
+
+# Logging (optional)
+log_level: info
+log_format: json
+log: ./ngrok.log

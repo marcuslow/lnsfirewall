@@ -24,13 +24,18 @@ echo 🌐 Public URL: https://lnsfirewall.ngrok.app/
 echo.
 
 REM Start ngrok in background and Python server in foreground
+REM Option 1: Use config file (if ngrok.yml is configured)
+REM start "ngrok" ngrok start lnsfirewall --config=ngrok.yml
+
+REM Option 2: Use command line with basic settings (current)
 start "ngrok" ngrok http 8000 --domain=lnsfirewall.ngrok.app
 
 REM Wait a moment for ngrok to start
 timeout /t 3 /nobreak >nul
 
-echo ✅ Starting HQ HTTP Server on localhost:8000...
+echo ✅ Starting HQ HTTP/WebSocket Server on localhost:8000...
 echo 🌐 Public HTTPS: https://lnsfirewall.ngrok.app/
+echo 🔌 WebSocket endpoint: wss://lnsfirewall.ngrok.app/ws
 echo 📡 HTTP API endpoints:
 "  - GET  /status"
 "  - GET  /clients"
