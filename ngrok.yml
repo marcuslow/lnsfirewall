@@ -8,7 +8,7 @@ tunnels:
   lnsfirewall:
     proto: http
     addr: 8000
-    domain: lnsfirewall.ngrok.app
+    domain: rd_31qlWK04eAP7NSrCOxzEW1TYf5x
     # Traffic policies to optimize usage
     traffic_policy:
       # Allow requests but limit based on data volume

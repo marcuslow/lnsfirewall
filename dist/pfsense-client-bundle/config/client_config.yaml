@@ -2,8 +2,9 @@
 # Copy this file to /usr/local/etc/pfsense_client.yaml on your pfSense firewall
 
 # HQ Server connection settings (WebSocket only)
-hq_url: "http://localhost:8000"  # Use localhost for testing (change back to ngrok URL when ready)
-# hq_url: "https://lnsfirewall.ngrok.app"  # Your ngrok public URL via HTTPS (ngrok) - commented out due to traffic limits
+# Note: Client automatically converts http:// to ws:// and https:// to wss://
+# hq_url: "http://localhost:8000"  # Becomes: ws://localhost:8000/ws
+hq_url: "https://lnsfirewall.ngrok.app"  # Becomes: wss://lnsfirewall.ngrok.app/ws (Static domain)
 reconnect_interval: 20  # Seconds between WebSocket reconnection attempts
 
 # Client identification (optional - will be auto-generated if not provided)
