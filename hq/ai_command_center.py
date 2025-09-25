@@ -24,6 +24,12 @@ try:
 except Exception:
     RulesQueryEngine = None  # Will handle gracefully at call site
 
+# Local LQE (Logs Query Engine)
+try:
+    from lqe import LogQueryEngine
+except Exception:
+    LogQueryEngine = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +47,8 @@ class AICommandCenter:
         self.db_path = db_path or DEFAULT_DB_PATH
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
         self.conversation_history = []
+        # Remember last requested logs window per client for better defaults
+        self.last_logs_request_days: Dict[str, int] = {}
 
         # Define function tools for OpenAI
         self.function_tools = [
@@ -63,18 +71,18 @@ class AICommandCenter:
             {
                 "type": "function",
                 "function": {
-                    "name": "get_firewall_logs",
-                    "description": "Retrieve firewall logs from a specific client",
+                    "name": "request_client_logs",
+                    "description": "Request log collection from one or more clients (no logs content returned to AI)",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "client_id": {
                                 "type": "string",
-                                "description": "Client ID or name to get logs from"
+                                "description": "Client ID/name, comma-separated list, or 'all'"
                             },
                             "days": {
                                 "type": "integer",
-                                "description": "Number of days of logs to retrieve (default: 7, max: 90)",
+                                "description": "Number of days of logs to collect (default: 7, max: 90)",
                                 "default": 7
                             }
                         },
@@ -153,11 +161,28 @@ class AICommandCenter:
                                 "type": "string",
                                 "description": "Ruleset ID to push (must be the latest for the client)"
                             }
-                        },
-                        "required": ["client_id", "ruleset_id"]
+                            },
+                            "required": ["client_id", "ruleset_id"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "query_logs",
+                        "description": "Query and summarize locally stored firewall logs without sending raw logs to AI.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "client_id": {"type": "string", "description": "Client ID or name to query logs for"},
+                                "query": {"type": "string", "description": "What to look for (e.g., 'summary', 'blocked', 'port 22', 'ssh', 'ip 1.2.3.4')"},
+                                "days": {"type": "integer", "description": "Lookback window in days (default: 7)", "default": 7},
+                                "top_n": {"type": "integer", "description": "How many top items to return in summaries (default: 10)", "default": 10}
+                            },
+                            "required": ["client_id", "query"]
+                        }
                     }
                 }
-            }
         ]
     def _truncate_string(self, s: str, max_len: int = 4000) -> str:
         if not isinstance(s, str):
@@ -174,11 +199,29 @@ class AICommandCenter:
                 # Copy and truncate potentially large fields
                 res = dict(result)
                 big_fields = [
-                    'rules_xml', 'config_xml', 'logs', 'log_data', 'content', 'data'
+                    'rules_xml', 'config_xml', 'log_data', 'content', 'data'
                 ]
                 for f in big_fields:
                     if f in res and isinstance(res[f], str):
                         res[f] = self._truncate_string(res[f], 4000)
+                # Never include raw log entries in AI context; summarize instead
+                if 'logs' in res and isinstance(res['logs'], list):
+                    summarized_logs = []
+                    total_entries = 0
+                    for item in res['logs']:
+                        try:
+                            entries = item.get('entries', []) if isinstance(item, dict) else []
+                            total_entries += len(entries) if isinstance(entries, list) else 0
+                            summarized_logs.append({
+                                k: v for k, v in item.items() if k in ('client_id', 'timestamp', 'size_bytes')
+                            } | {'entry_count': len(entries) if isinstance(entries, list) else 0})
+                        except Exception:
+                            continue
+                    res['logs_summary'] = summarized_logs
+                    res.pop('logs', None)
+                    # Include totals if present
+                    if 'total_entries' in res:
+                        res['total_entries'] = total_entries
                 # As a safeguard, cap overall JSON size
                 payload = json.dumps(res)
                 if len(payload) > 6000:
@@ -282,6 +325,11 @@ class AICommandCenter:
             for cid in ids:
                 cmd_id = enqueue(cid)
                 results[cid] = {"command_id": cmd_id, "days": days}
+                # Remember the window we just requested for this client
+                try:
+                    self.last_logs_request_days[cid] = days
+                except Exception:
+                    pass
 
             return {"success": True, "message": f"Log collection requested from {len(ids)} client(s)", "clients": results}
         except Exception as e:
@@ -520,6 +568,11 @@ class AICommandCenter:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+
+
+
+
+
     async def push_rules(self, client_id: str, ruleset_id: str) -> Dict[str, Any]:
         """Push a stored ruleset to a client with freshness guard on server"""
         try:
@@ -527,6 +580,7 @@ class AICommandCenter:
             actual_client_id = client_id
             res = requests.get(f"{self.hq_url}/clients", timeout=30)
             res.raise_for_status()
+
             clients = res.json().get('clients', {})
             if client_id not in clients:
                 for cid, info in clients.items():
@@ -587,6 +641,7 @@ class AICommandCenter:
 
                     logs_data.append({
                         'client_id': client_id_db,
+
                         'timestamp': timestamp,
                         'entries': log_entries,
                         'size_bytes': size_bytes
@@ -622,8 +677,7 @@ class AICommandCenter:
             elif function_name == "query_cached_rules":
                 return await self.query_cached_rules(arguments['client_id'], arguments['query'])
             elif function_name == "push_rules":
-                return await self.push_rules(arguments['client_id'], arguments['ruleset_id'])
-            elif function_name == "update_firewall_rules":
+
                 return await self.update_firewall_rules(
                     arguments['client_id'],
                     arguments['rules_xml']
@@ -635,11 +689,108 @@ class AICommandCenter:
                     arguments.get('client_id'),
                     arguments.get('days', 7)
                 )
+            elif function_name == "query_logs":
+                return await self.query_logs(
+                    arguments['client_id'],
+                    arguments['query'],
+                    arguments.get('days'),
+                    arguments.get('top_n')
+                )
+
             else:
                 return {"success": False, "error": f"Unknown function: {function_name}"}
 
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    async def query_logs(self, client_id: str, query: str, days: Optional[int] = None, top_n: Optional[int] = None) -> Dict[str, Any]:
+        """Query locally stored logs using LogQueryEngine. No raw logs are sent to AI."""
+        try:
+            if LogQueryEngine is None:
+                return {"success": False, "error": "LogQueryEngine module not available"}
+
+            # Default window selection: use last requested for this client, else 7
+            effective_days = days if isinstance(days, int) and days > 0 else self.last_logs_request_days.get(client_id, 7)
+            effective_top_n = top_n if isinstance(top_n, int) and top_n > 0 else 10
+
+            # Map provided name -> actual ID as needed
+            actual_client_id = client_id
+            try:
+                res = requests.get(f"{self.hq_url}/clients", timeout=30)
+                res.raise_for_status()
+                clients = res.json().get('clients', {})
+                name_to_id = {v.get('client_name', ''): k for k, v in clients.items()}
+                if client_id in name_to_id:
+                    actual_client_id = name_to_id[client_id]
+            except Exception:
+                pass
+
+            lqe = LogQueryEngine.from_db(self.db_path, actual_client_id, since_days=effective_days)
+
+            def compact(entries: List[Any]) -> List[Dict[str, Any]]:
+                out = []
+                for x in entries[:effective_top_n]:
+                    out.append({
+                        'timestamp': getattr(x, 'timestamp', None),
+                        'action': getattr(x, 'action', None),
+                        'proto': getattr(x, 'proto', None),
+                        'interface': getattr(x, 'interface', None),
+                        'src': getattr(x, 'src', None),
+                        'src_port': getattr(x, 'src_port', None),
+                        'dst': getattr(x, 'dst', None),
+                        'dst_port': getattr(x, 'dst_port', None),
+                    })
+                return out
+
+            q = (query or '').strip().lower()
+            results: Dict[str, Any] = {}
+
+            # Intent routing
+            if 'summary' in q or q in ('logs', 'log summary'):
+                results = {'summary': lqe.summarize(top_n=effective_top_n)}
+            elif any(k in q for k in ['blocked', 'block', 'reject']):
+                bl = lqe.filter_blocked()
+                results = {'blocked_count': len(bl), 'examples': compact(bl)}
+            elif any(k in q for k in ['allowed', 'allow', 'pass']):
+                al = lqe.filter_allowed()
+                results = {'allowed_count': len(al), 'examples': compact(al)}
+            elif 'ssh' in q:
+                hits = lqe.filter_by_service('ssh')
+                results = {'service': 'ssh', 'count': len(hits), 'examples': compact(hits)}
+            elif 'https' in q:
+                hits = lqe.filter_by_service('https')
+                results = {'service': 'https', 'count': len(hits), 'examples': compact(hits)}
+            elif 'http' in q:
+                hits = lqe.filter_by_service('http')
+                results = {'service': 'http', 'count': len(hits), 'examples': compact(hits)}
+            elif 'port' in q:
+                import re as _re
+                m = _re.search(r"(\d{1,5})", q)
+                if m:
+                    p = int(m.group(1))
+                    hits = lqe.filter_by_port(p)
+                    results = {'port': p, 'count': len(hits), 'examples': compact(hits)}
+                else:
+                    results = {'note': 'No port number found in query'}
+            elif any(k in q for k in ['ip', 'addr', 'address', 'host']):
+                import re as _re
+                m = _re.search(r"(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)", q)
+                frag = m.group(1) if m else ''
+                hits = lqe.filter_by_ip_fragment(frag) if frag else []
+                results = {'ip_fragment': frag, 'count': len(hits), 'examples': compact(hits)}
+            else:
+                results = {'summary': lqe.summarize(top_n=effective_top_n)}
+
+            return {
+                'success': True,
+                'query': query,
+                'days': effective_days,
+                'client_id': actual_client_id,
+                'results': results
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
 
     async def chat_with_ai(self, user_message: str) -> str:
         """Chat with AI assistant for firewall management"""
@@ -699,6 +850,7 @@ Be helpful, informative, and prioritize security in all recommendations. When an
                 tools=self.function_tools,
                 tool_choice="auto",
                 temperature=0.7,
+
                 max_tokens=1500
             )
 
