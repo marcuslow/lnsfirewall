@@ -111,7 +111,13 @@ class PfSenseClient:
         """Send message to HQ server via WebSocket"""
         try:
             if self.websocket:
-                await self.websocket.send(json.dumps(message))
+                message_json = json.dumps(message)
+                message_size = len(message_json)
+                logger.debug(f"Sending WebSocket message, size: {message_size} bytes, type: {message.get('type')}")
+                await self.websocket.send(message_json)
+                logger.debug(f"WebSocket message sent successfully")
+            else:
+                logger.error("Cannot send message: WebSocket not connected")
         except Exception as e:
             logger.error(f"Error sending WebSocket message: {e}")
             # Mark connection as broken
@@ -197,11 +203,16 @@ class PfSenseClient:
                                 response = await self.handle_command(command)
 
                                 # Send response back
-                                await self.send_message({
-                                    "type": "response",
-                                    "command_id": command.get("id"),
-                                    "data": response
-                                })
+                                logger.info(f"Sending response for command {command.get('id')}, response size: {len(str(response))} chars")
+                                try:
+                                    await self.send_message({
+                                        "type": "response",
+                                        "command_id": command.get("id"),
+                                        "data": response
+                                    })
+                                    logger.info(f"Response sent successfully for command {command.get('id')}")
+                                except Exception as e:
+                                    logger.error(f"Failed to send response for command {command.get('id')}: {e}")
 
                         elif message.get("type") == "heartbeat_ack":
                             logger.debug("Received heartbeat acknowledgment")
@@ -620,27 +631,48 @@ class PfSenseClient:
     async def get_firewall_rules(self) -> Dict[str, Any]:
         """Get current firewall rules"""
         try:
+            logger.info("Starting to get firewall rules...")
             rules_file = '/cf/conf/config.xml'
             if not os.path.exists(rules_file):
                 return {'status': 'error', 'message': 'pfSense config file not found'}
 
+            logger.info("Reading config file...")
             with open(rules_file, 'r') as f:
                 config_content = f.read()
 
-            # Extract rules section (simplified XML parsing)
+            logger.info(f"Config file read successfully, size: {len(config_content)} bytes")
+
+            # Extract rules section with more robust parsing
             import re
-            rules_match = re.search(r'<filter>(.*?)</filter>', config_content, re.DOTALL)
-            if rules_match:
-                rules_xml = rules_match.group(1)
+            logger.info("Extracting filter section...")
+
+            # Find the start and end of the filter section
+            filter_start = config_content.find('<filter>')
+            filter_end = config_content.find('</filter>')
+
+            if filter_start != -1 and filter_end != -1:
+                # Extract content between <filter> and </filter>
+                rules_xml = config_content[filter_start + 8:filter_end]  # +8 to skip '<filter>'
+                logger.info(f"Filter section extracted, size: {len(rules_xml)} bytes")
+
+                # Limit the size to prevent WebSocket issues (max 50KB)
+                if len(rules_xml) > 50000:
+                    rules_xml = rules_xml[:50000] + "\n<!-- TRUNCATED - Rules too large -->"
+                    logger.warning("Rules truncated due to size limit")
             else:
                 rules_xml = ""
+                logger.warning("No filter section found in config")
 
-            return {
+            result = {
                 'status': 'success',
                 'rules_xml': rules_xml,
                 'config_size': len(config_content),
+                'rules_size': len(rules_xml),
                 'timestamp': datetime.now().isoformat()
             }
+
+            logger.info("Firewall rules extracted successfully")
+            return result
 
         except Exception as e:
             logger.error(f"Error getting firewall rules: {e}")
@@ -779,11 +811,25 @@ def main():
     args = parser.parse_args()
 
     if args.daemon:
-        # Simple daemonization
-        import daemon
-        with daemon.DaemonContext():
-            client = PfSenseClient(args.config)
-            asyncio.run(client.run())
+        # Simple daemonization that preserves logging
+        import os
+        import sys
+
+        # Fork to background
+        if os.fork() > 0:
+            sys.exit(0)  # Parent exits
+
+        # Child continues as daemon
+        os.setsid()  # Create new session
+        os.chdir('/')  # Change to root directory
+
+        # Redirect stdin/stdout/stderr but keep logging intact
+        sys.stdin = open('/dev/null', 'r')
+        sys.stdout = open('/dev/null', 'w')
+        sys.stderr = open('/dev/null', 'w')
+
+        client = PfSenseClient(args.config)
+        asyncio.run(client.run())
     else:
         client = PfSenseClient(args.config)
         asyncio.run(client.run())

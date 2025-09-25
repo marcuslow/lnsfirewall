@@ -23,11 +23,15 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+# Resolve a single, absolute DB path shared with the server
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
+DEFAULT_DB_PATH = os.getenv('HQ_DB_PATH', os.path.join(BASE_DIR, 'hq_database.db'))
+
 
 class AICommandCenter:
-    def __init__(self, hq_url: str, openai_api_key: str, db_path: str = 'hq_database.db'):
+    def __init__(self, hq_url: str, openai_api_key: str, db_path: str = DEFAULT_DB_PATH):
         self.hq_url = hq_url.rstrip('/')
-        self.db_path = db_path
+        self.db_path = db_path or DEFAULT_DB_PATH
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
         self.conversation_history = []
 
@@ -43,7 +47,7 @@ class AICommandCenter:
                         "properties": {
                             "client_id": {
                                 "type": "string",
-                                "description": "Optional client ID or client name to get status for specific client. Can be a single client or comma-separated list. If not provided, returns status for all clients. Examples: 'opus-1', 'opus-1,james-office,central-lion', 'firewall-branch-2'"
+                                "description": "Optional specific client ID or name to get status for"
                             }
                         }
                     }
@@ -52,23 +56,22 @@ class AICommandCenter:
             {
                 "type": "function",
                 "function": {
-                    "name": "request_client_logs",
-                    "description": "Request firewall logs from one or all clients for a specified time period. Includes filter logs, pfBlockerNG logs, and system logs with detailed parsing and statistics.",
+                    "name": "get_firewall_logs",
+                    "description": "Retrieve firewall logs from a specific client",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "client_id": {
                                 "type": "string",
-                                "description": "Client ID or client name to request logs from. Can be single client, comma-separated list, or 'all' for all clients. Examples: 'opus-1', 'opus-1,james-office,central-lion', 'all'"
+                                "description": "Client ID or name to get logs from"
                             },
                             "days": {
                                 "type": "integer",
-                                "description": "Number of days of logs to retrieve (max 90)",
-                                "minimum": 1,
-                                "maximum": 90
+                                "description": "Number of days of logs to retrieve (default: 7, max: 90)",
+                                "default": 7
                             }
                         },
-                        "required": ["client_id", "days"]
+                        "required": ["client_id"]
                     }
                 }
             },
@@ -76,13 +79,13 @@ class AICommandCenter:
                 "type": "function",
                 "function": {
                     "name": "get_firewall_rules",
-                    "description": "Get current firewall rules from a specific client",
+                    "description": "Get firewall rules from a client (uses cache if recent, fetches fresh if needed). Use this for initial rule retrieval.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "client_id": {
                                 "type": "string",
-                                "description": "Client ID to get firewall rules from"
+                                "description": "Client ID or name to get rules from"
                             }
                         },
                         "required": ["client_id"]
@@ -92,35 +95,14 @@ class AICommandCenter:
             {
                 "type": "function",
                 "function": {
-                    "name": "update_firewall_rules",
-                    "description": "Update firewall rules on a specific client",
+                    "name": "get_rules_status",
+                    "description": "Get the status and metadata of the latest ingested ruleset for a client",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "client_id": {
                                 "type": "string",
-                                "description": "Client ID to update firewall rules on"
-                            },
-                            "rules_xml": {
-                                "type": "string",
-                                "description": "New firewall rules in XML format"
-                            }
-                        },
-                        "required": ["client_id", "rules_xml"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "restart_firewall",
-                    "description": "Restart firewall service on a specific client",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "client_id": {
-                                "type": "string",
-                                "description": "Client ID to restart firewall on"
+                                "description": "Client ID or name to check rules status for"
                             }
                         },
                         "required": ["client_id"]
@@ -130,26 +112,83 @@ class AICommandCenter:
             {
                 "type": "function",
                 "function": {
-                    "name": "get_stored_logs",
-                    "description": "Retrieve previously collected logs from the database",
+                    "name": "query_cached_rules",
+                    "description": "Query and analyze cached firewall rules without fetching fresh data. Use this to search/analyze rules that were already retrieved.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "client_id": {
                                 "type": "string",
-                                "description": "Optional client ID to filter logs. If not provided, returns logs from all clients"
+                                "description": "Client ID or name to query cached rules for"
                             },
-                            "days": {
-                                "type": "integer",
-                                "description": "Number of days back to retrieve logs from database",
-                                "minimum": 1,
-                                "maximum": 365
+                            "query": {
+                                "type": "string",
+                                "description": "What to search for in the rules (e.g., 'port forwarding', 'SSH access', 'port 80')"
                             }
-                        }
+                        },
+                        "required": ["client_id", "query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "push_rules",
+                    "description": "Push a specific ruleset to a client (enforces 6-hour freshness check)",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "client_id": {
+                                "type": "string",
+                                "description": "Client ID or name to push rules to"
+                            },
+                            "ruleset_id": {
+                                "type": "string",
+                                "description": "Ruleset ID to push (must be the latest for the client)"
+                            }
+                        },
+                        "required": ["client_id", "ruleset_id"]
                     }
                 }
             }
         ]
+    def _truncate_string(self, s: str, max_len: int = 4000) -> str:
+        if not isinstance(s, str):
+            return s
+        if len(s) <= max_len:
+            return s
+        head = s[:2000]
+        tail = s[-500:]
+        return f"[TRUNCATED {len(s)} chars] " + head + " ... " + tail
+
+    def _sanitize_tool_result(self, result: Any) -> Any:
+        try:
+            if isinstance(result, dict):
+                # Copy and truncate potentially large fields
+                res = dict(result)
+                big_fields = [
+                    'rules_xml', 'config_xml', 'logs', 'log_data', 'content', 'data'
+                ]
+                for f in big_fields:
+                    if f in res and isinstance(res[f], str):
+                        res[f] = self._truncate_string(res[f], 4000)
+                # As a safeguard, cap overall JSON size
+                payload = json.dumps(res)
+                if len(payload) > 6000:
+                    # Keep only keys and sizes
+                    summary = {k: (len(v) if isinstance(v, str) else v) for k, v in res.items()}
+                    return {
+                        'success': res.get('success', True),
+                        'note': 'Payload truncated for AI context limits',
+                        'summary': summary
+                    }
+                return res
+            return result
+        except Exception:
+            return {'success': False, 'note': 'Failed to sanitize tool result'}
+
+
+
 
     async def get_client_status(self, client_id: Optional[str] = None) -> Dict[str, Any]:
         """Get status of clients via HTTP API"""
@@ -242,11 +281,112 @@ class AICommandCenter:
             return {"success": False, "error": str(e)}
 
     async def get_firewall_rules(self, client_id: str) -> Dict[str, Any]:
-        """Enqueue get_rules for client via HTTP"""
+        """Get firewall rules from client and wait for response"""
         try:
+            # First, get the actual client ID if a client name was provided
+            actual_client_id = client_id
+            res = requests.get(f"{self.hq_url}/clients", timeout=30)
+            res.raise_for_status()
+            clients = res.json().get('clients', {})
+
+            # Check if client_id is actually a client name, and get the real ID
+            if client_id not in clients:
+                # Look for client by name
+                for cid, client_info in clients.items():
+                    if client_info.get('client_name') == client_id:
+                        actual_client_id = cid
+                        logger.info(f"Mapped client name '{client_id}' to actual client ID '{actual_client_id}'")
+                        break
+                else:
+                    return {"success": False, "error": f"Client '{client_id}' not found"}
+
+            # Check if we have recent rules (less than 5 minutes old)
+            try:
+                status_res = requests.get(f"{self.hq_url}/rules/status", params={"client_id": actual_client_id}, timeout=10)
+                if status_res.status_code == 200:
+                    status_data = status_res.json()
+                    if status_data.get("success") and status_data.get("age_minutes", 999) < 5:
+                        # Get the actual rules XML from the database
+                        async with aiosqlite.connect(self.db_path) as db:
+                            cursor = await db.execute('''
+                                SELECT rules_xml FROM rulesets
+                                WHERE client_id = ? AND ruleset_id = ?
+                            ''', (actual_client_id, status_data.get("ruleset_id")))
+                            rules_result = await cursor.fetchone()
+
+                            rules_xml = rules_result[0] if rules_result else ""
+
+                        return {
+                            "success": True,
+                            "message": f"Using cached rules for client {client_id} (age: {status_data.get('age_minutes', 0):.1f} minutes)",
+                            "rules_count": status_data.get("rules_count", 0),
+                            "rules_xml": rules_xml,
+                            "ruleset_id": status_data.get("ruleset_id"),
+                            "cached": True,
+                            "age_minutes": status_data.get("age_minutes", 0)
+                        }
+            except Exception as e:
+                logger.debug(f"Could not check cached rules: {e}")
+
+            # No recent rules found, fetch fresh ones
+            logger.info(f"Fetching fresh rules for client {client_id}")
+            # Send the command using the provided client_id (name or ID)
             r = requests.post(f"{self.hq_url}/command", json={"client_id": client_id, "command_type": "get_rules"}, timeout=30)
             r.raise_for_status()
-            return {"success": True, "message": f"Firewall rules requested from client {client_id}", "command_id": r.json().get('command_id')}
+            command_id = r.json().get('command_id')
+
+            if not command_id:
+                return {"success": False, "error": "No command ID returned"}
+
+            # Wait for the response using the ACTUAL client ID for database lookup
+            import time
+            max_wait = 30  # seconds
+            start_time = time.time()
+
+            while time.time() - start_time < max_wait:
+                try:
+                    # Check if response is available in database using ACTUAL client ID
+                    async with aiosqlite.connect(self.db_path) as db:
+                        cursor = await db.execute('''
+                            SELECT status, response_data FROM commands
+                            WHERE id = ?
+                        ''', (command_id,))
+                        result = await cursor.fetchone()
+
+                        if result and result[0] == 'completed':
+                            response_data = json.loads(result[1]) if result[1] else {}
+                            if response_data.get('status') == 'success':
+                                rules_xml = response_data.get('rules_xml', '')
+                                try:
+                                    ing = requests.post(f"{self.hq_url}/rules/ingest", json={
+                                        "client_id": actual_client_id,
+                                        "rules_xml": rules_xml,
+                                        "command_id": command_id
+                                    }, timeout=30)
+                                    ing.raise_for_status()
+                                    ingest_info = ing.json()
+                                except Exception as e:
+                                    ingest_info = {"success": False, "error": str(e)}
+                                return {
+                                    "success": True,
+                                    "message": f"Fresh firewall rules retrieved and indexed for {client_id}",
+                                    "ruleset_id": ingest_info.get("ruleset_id"),
+                                    "ingested_at": ingest_info.get("ingested_at"),
+                                    "rule_count": ingest_info.get("rule_count"),
+                                    "size_bytes": ingest_info.get("size_bytes"),
+                                    "cached": False
+                                }
+                            else:
+                                return {"success": False, "error": response_data.get('message', 'Unknown error')}
+
+                except Exception as e:
+                    logger.error(f"Error checking command response: {e}")
+
+                # Wait a bit before checking again
+                await asyncio.sleep(1)
+
+            return {"success": False, "error": f"Timeout waiting for response from {client_id}"}
+
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -265,6 +405,115 @@ class AICommandCenter:
             r = requests.post(f"{self.hq_url}/command", json={"client_id": client_id, "command_type": "restart_firewall"}, timeout=30)
             r.raise_for_status()
             return {"success": True, "message": f"Firewall restart command sent to client {client_id}", "command_id": r.json().get('command_id')}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_rules_status(self, client_id: str) -> Dict[str, Any]:
+        """Get latest rules status for a client (age, ruleset_id, counts)"""
+        try:
+            # Map name -> actual ID
+            actual_client_id = client_id
+            res = requests.get(f"{self.hq_url}/clients", timeout=30)
+            res.raise_for_status()
+            clients = res.json().get('clients', {})
+            if client_id not in clients:
+                for cid, info in clients.items():
+                    if info.get('client_name') == client_id:
+                        actual_client_id = cid
+                        break
+                else:
+                    return {"success": False, "error": f"Client '{client_id}' not found"}
+            # Fetch status
+            s = requests.get(f"{self.hq_url}/rules/status", params={"client_id": actual_client_id}, timeout=30)
+            s.raise_for_status()
+            return s.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def query_cached_rules(self, client_id: str, query: str) -> Dict[str, Any]:
+        """Query cached firewall rules without fetching fresh data"""
+        try:
+            # Map name -> actual ID
+            actual_client_id = client_id
+            res = requests.get(f"{self.hq_url}/clients", timeout=30)
+            res.raise_for_status()
+            clients = res.json().get('clients', {})
+
+            if client_id not in clients:
+                for cid, client_info in clients.items():
+                    if client_info.get('client_name') == client_id:
+                        actual_client_id = cid
+                        break
+                else:
+                    return {"success": False, "error": f"Client '{client_id}' not found"}
+
+            # Get cached rules from database
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute('''
+                    SELECT rules_xml, rule_count, ingested_at, id
+                    FROM rulesets
+                    WHERE client_id = ?
+                    ORDER BY ingested_at DESC
+                    LIMIT 1
+                ''', (actual_client_id,))
+                result = await cursor.fetchone()
+
+                if not result:
+                    return {"success": False, "error": f"No cached rules found for client {client_id}. Use get_firewall_rules first."}
+
+                rules_xml, rule_count, ingested_at, ruleset_id = result
+
+                # Search for the query in the rules XML
+                query_lower = query.lower()
+                rules_lower = rules_xml.lower()
+
+                matches = []
+                if 'port forwarding' in query_lower or 'forwarding' in query_lower:
+                    # Look for NAT/redirect rules
+                    if 'redirect' in rules_lower or 'nat' in rules_lower:
+                        matches.append("Found NAT/redirect configuration in rules")
+                    else:
+                        matches.append("No port forwarding rules found")
+                else:
+                    # General search
+                    if query_lower in rules_lower:
+                        matches.append(f"Found '{query}' in firewall rules")
+                    else:
+                        matches.append(f"No matches found for '{query}'")
+
+                return {
+                    "success": True,
+                    "message": f"Searched cached rules for '{query}' in client {client_id}",
+                    "query": query,
+                    "results": matches,
+                    "rule_count": rule_count,
+                    "ruleset_id": ruleset_id
+                }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def push_rules(self, client_id: str, ruleset_id: str) -> Dict[str, Any]:
+        """Push a stored ruleset to a client with freshness guard on server"""
+        try:
+            # Map name -> actual ID
+            actual_client_id = client_id
+            res = requests.get(f"{self.hq_url}/clients", timeout=30)
+            res.raise_for_status()
+            clients = res.json().get('clients', {})
+            if client_id not in clients:
+                for cid, info in clients.items():
+                    if info.get('client_name') == client_id:
+                        actual_client_id = cid
+                        break
+                else:
+                    return {"success": False, "error": f"Client '{client_id}' not found"}
+            # Push
+            p = requests.post(f"{self.hq_url}/rules/push", json={"client_id": actual_client_id, "ruleset_id": ruleset_id}, timeout=60)
+            if p.status_code == 409:
+                return {"success": False, "error": p.json().get('detail', 'Push blocked'), "blocked": True}
+            p.raise_for_status()
+            return {"success": True, **p.json(), "client_id": actual_client_id}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -341,6 +590,12 @@ class AICommandCenter:
                 )
             elif function_name == "get_firewall_rules":
                 return await self.get_firewall_rules(arguments['client_id'])
+            elif function_name == "get_rules_status":
+                return await self.get_rules_status(arguments['client_id'])
+            elif function_name == "query_cached_rules":
+                return await self.query_cached_rules(arguments['client_id'], arguments['query'])
+            elif function_name == "push_rules":
+                return await self.push_rules(arguments['client_id'], arguments['ruleset_id'])
             elif function_name == "update_firewall_rules":
                 return await self.update_firewall_rules(
                     arguments['client_id'],
@@ -407,8 +662,8 @@ Client Addressing:
 Be helpful, informative, and prioritize security in all recommendations. When analyzing logs, provide insights about security events, blocked threats, and traffic patterns."""
             }
 
-            # Prepare messages for OpenAI
-            messages = [system_message] + self.conversation_history[-10:]  # Keep last 10 messages
+            # Prepare messages for OpenAI (limit history to reduce token usage)
+            messages = [system_message] + self.conversation_history[-8:]
 
             # Make API call to OpenAI
             response = self.openai_client.chat.completions.create(
@@ -450,11 +705,12 @@ Be helpful, informative, and prioritize security in all recommendations. When an
 
                     result = await self.execute_function_call(function_name, arguments)
 
-                    # Add function result to conversation
+                    # Add sanitized function result to conversation (avoid huge payloads)
+                    sanitized = self._sanitize_tool_result(result)
                     self.conversation_history.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(result)
+                        "content": json.dumps(sanitized)
                     })
 
                     function_results.append(result)
@@ -462,9 +718,9 @@ Be helpful, informative, and prioritize security in all recommendations. When an
                 # Get final response from AI with function results
                 final_response = self.openai_client.chat.completions.create(
                     model="gpt-4",
-                    messages=[system_message] + self.conversation_history[-15:],
+                    messages=[system_message] + self.conversation_history[-8:],
                     temperature=0.7,
-                    max_tokens=1500
+                    max_tokens=800
                 )
 
                 final_message = final_response.choices[0].message.content
@@ -505,7 +761,7 @@ async def main():
     parser = argparse.ArgumentParser(description='AI Command Center for Firewall Management')
     parser.add_argument('--openai-key', help='OpenAI API key (can also be set via OPENAI_API_KEY env var)')
     parser.add_argument('--hq-url', default=os.getenv('HQ_URL', 'http://localhost:8000'), help='HTTP HQ base URL (e.g., https://lnsfirewall.ngrok.app)')
-    parser.add_argument('--db', default='hq_database.db', help='Database file path')
+    parser.add_argument('--db', default=DEFAULT_DB_PATH, help='Database file path')
 
     args = parser.parse_args()
 
