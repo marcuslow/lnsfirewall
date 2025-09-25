@@ -16,6 +16,13 @@ import gzip
 import base64
 from dotenv import load_dotenv
 import requests
+import re
+
+# Local RQE (Rules Query Engine)
+try:
+    from rqe import RulesQueryEngine
+except Exception:
+    RulesQueryEngine = None  # Will handle gracefully at call site
 
 # Configure logging
 logging.basicConfig(
@@ -431,14 +438,16 @@ class AICommandCenter:
             return {"success": False, "error": str(e)}
 
     async def query_cached_rules(self, client_id: str, query: str) -> Dict[str, Any]:
-        """Query cached firewall rules without fetching fresh data"""
+        """Query cached firewall rules using the local Rules Query Engine (no network)."""
         try:
+            if RulesQueryEngine is None:
+                return {"success": False, "error": "RulesQueryEngine module not available"}
+
             # Map name -> actual ID
             actual_client_id = client_id
             res = requests.get(f"{self.hq_url}/clients", timeout=30)
             res.raise_for_status()
             clients = res.json().get('clients', {})
-
             if client_id not in clients:
                 for cid, client_info in clients.items():
                     if client_info.get('client_name') == client_id:
@@ -447,49 +456,64 @@ class AICommandCenter:
                 else:
                     return {"success": False, "error": f"Client '{client_id}' not found"}
 
-            # Get cached rules from database
+            # Load latest cached rules XML from DB
             async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute('''
-                    SELECT rules_xml, rule_count, ingested_at, id
-                    FROM rulesets
-                    WHERE client_id = ?
-                    ORDER BY ingested_at DESC
-                    LIMIT 1
-                ''', (actual_client_id,))
-                result = await cursor.fetchone()
-
-                if not result:
+                cur = await db.execute(
+                    '''SELECT rules_xml, rule_count, ingested_at, id FROM rulesets WHERE client_id = ? ORDER BY ingested_at DESC LIMIT 1''',
+                    (actual_client_id,)
+                )
+                row = await cur.fetchone()
+                if not row:
                     return {"success": False, "error": f"No cached rules found for client {client_id}. Use get_firewall_rules first."}
+                rules_xml, rule_count, ingested_at, ruleset_id = row
 
-                rules_xml, rule_count, ingested_at, ruleset_id = result
+            # Parse with RQE
+            rqe = RulesQueryEngine(rules_xml)
+            q = query.lower().strip()
 
-                # Search for the query in the rules XML
-                query_lower = query.lower()
-                rules_lower = rules_xml.lower()
-
-                matches = []
-                if 'port forwarding' in query_lower or 'forwarding' in query_lower:
-                    # Look for NAT/redirect rules
-                    if 'redirect' in rules_lower or 'nat' in rules_lower:
-                        matches.append("Found NAT/redirect configuration in rules")
-                    else:
-                        matches.append("No port forwarding rules found")
+            # Determine intent
+            results: Dict[str, Any]
+            if any(k in q for k in ["port forwarding", "forwarding", "nat", "redirect"]):
+                pf = [rqe._nat_to_dict(n) for n in rqe.list_port_forwarding()]
+                results = {"port_forwarding": pf}
+            elif any(k in q for k in ["ssh"]):
+                results = rqe.find_rules_by_service("ssh")
+            elif "https" in q:
+                results = rqe.find_rules_by_service("https")
+            elif "http" in q:
+                results = rqe.find_rules_by_service("http")
+            elif "port" in q:
+                # Extract first integer from the text
+                m = re.search(r"(\d{1,5})", q)
+                if m:
+                    port = int(m.group(1))
+                    results = rqe.find_rules_by_port(port)
                 else:
-                    # General search
-                    if query_lower in rules_lower:
-                        matches.append(f"Found '{query}' in firewall rules")
-                    else:
-                        matches.append(f"No matches found for '{query}'")
+                    results = {"nat": [], "filter": []}
+            elif any(k in q for k in ["block", "blocked", "reject"]):
+                results = {"blocking": rqe.find_blocking_rules()}
+            elif any(k in q for k in ["ip", "address", "host"]):
+                # Try to pull an IP fragment after the word
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)", q)
+                frag = m.group(1) if m else ""
+                results = {"matching": rqe.find_rules_with_ip(frag) if frag else []}
+            else:
+                # Fallback to summary
+                results = {"summary": rqe.summarize()}
 
-                return {
-                    "success": True,
-                    "message": f"Searched cached rules for '{query}' in client {client_id}",
-                    "query": query,
-                    "results": matches,
-                    "rule_count": rule_count,
-                    "ruleset_id": ruleset_id
-                }
-
+            return {
+                "success": True,
+                "query": query,
+                "results": results,
+                "counts": {
+                    "nat": len(results.get("nat", [])) if isinstance(results.get("nat"), list) else None,
+                    "filter": len(results.get("filter", [])) if isinstance(results.get("filter"), list) else None,
+                    "blocking": len(results.get("blocking", [])) if isinstance(results.get("blocking", list)) else None,
+                    "port_forwarding": len(results.get("port_forwarding", [])) if isinstance(results.get("port_forwarding", list)) else None,
+                },
+                "rule_count": rule_count,
+                "ruleset_id": ruleset_id
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
 
