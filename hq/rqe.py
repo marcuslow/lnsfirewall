@@ -295,6 +295,9 @@ class RulesQueryEngine:
     def find_blocking_rules(self) -> List[Dict[str, Any]]:
         return [self._filter_to_dict(r) for r in self.filter_rules if r.action in ("block", "reject")]
 
+    def find_allowed_rules(self) -> List[Dict[str, Any]]:
+        return [self._filter_to_dict(r) for r in self.filter_rules if r.action == "pass"]
+
     def find_rules_with_ip(self, ip_fragment: str) -> List[Dict[str, Any]]:
         ip_fragment = ip_fragment.strip().lower()
         out: List[Dict[str, Any]] = []

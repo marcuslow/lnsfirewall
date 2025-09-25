@@ -63,6 +63,11 @@ async def main():
     ip_matches = rqe.find_rules_with_ip('192.168.')
     print('\nRules with 192.168.*:', json.dumps(ip_matches[:5], indent=2))
 
+    # 7) Allowed rules
+    allowed = rqe.find_allowed_rules()
+    print(f'\nAllowed rules count: {len(allowed)}')
+    print('First 3 allowed rules:', json.dumps(allowed[:3], indent=2))
+
 
 if __name__ == '__main__':
     asyncio.run(main())
