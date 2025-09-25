@@ -68,7 +68,7 @@ fi
 
 # Create service script for pfSense
 echo "🔧 Creating service script..."
-cat > /usr/local/etc/rc.d/pfsense_client << 'EOF'
+cat > /usr/local/etc/rc.d/pfsense_client << EOF
 #!/bin/sh
 
 # PROVIDE: pfsense_client
@@ -80,7 +80,7 @@ cat > /usr/local/etc/rc.d/pfsense_client << 'EOF'
 name="pfsense_client"
 rcvar="pfsense_client_enable"
 
-command="/usr/local/bin/python3"
+command="\$(which ${PYTHON_CMD})"
 command_args="/usr/local/bin/pfsense_client.py --daemon"
 pidfile="/var/run/pfsense_client.pid"
 
