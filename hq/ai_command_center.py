@@ -492,6 +492,8 @@ class AICommandCenter:
                     results = {"nat": [], "filter": []}
             elif any(k in q for k in ["block", "blocked", "reject"]):
                 results = {"blocking": rqe.find_blocking_rules()}
+            elif any(k in q for k in ["allow", "allowed", "pass"]):
+                results = {"allowed": rqe.find_allowed_rules()}
             elif any(k in q for k in ["ip", "address", "host"]):
                 # Try to pull an IP fragment after the word
                 m = re.search(r"(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)", q)
@@ -508,8 +510,9 @@ class AICommandCenter:
                 "counts": {
                     "nat": len(results.get("nat", [])) if isinstance(results.get("nat"), list) else None,
                     "filter": len(results.get("filter", [])) if isinstance(results.get("filter"), list) else None,
-                    "blocking": len(results.get("blocking", [])) if isinstance(results.get("blocking", list)) else None,
-                    "port_forwarding": len(results.get("port_forwarding", [])) if isinstance(results.get("port_forwarding", list)) else None,
+                    "blocking": len(results.get("blocking", [])) if isinstance(results.get("blocking"), list) else None,
+                    "allowed": len(results.get("allowed", [])) if isinstance(results.get("allowed"), list) else None,
+                    "port_forwarding": len(results.get("port_forwarding", [])) if isinstance(results.get("port_forwarding"), list) else None,
                 },
                 "rule_count": rule_count,
                 "ruleset_id": ruleset_id
