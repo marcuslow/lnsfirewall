@@ -145,12 +145,14 @@ class PfSenseClient:
                 ping_timeout=10
             )
 
-            # Send registration message
+            # Send registration message with system health
+            system_health = await self.get_system_status()
             registration = {
                 "type": "register",
                 "client_id": self.client_id,
                 "client_name": self.client_name,
-                "hostname": self.get_pfsense_hostname() or 'unknown'
+                "hostname": self.get_pfsense_hostname() or 'unknown',
+                "system_health": system_health
             }
 
             await self.websocket.send(json.dumps(registration))

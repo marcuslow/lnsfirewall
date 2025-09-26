@@ -197,6 +197,23 @@ class AICommandCenter:
                             "required": ["client_id", "query"]
                         }
                     }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_system_health",
+                        "description": "Get comprehensive system health information for a firewall client including uptime, CPU, memory, disk usage, and network stats",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "client_id": {
+                                    "type": "string",
+                                    "description": "Client ID or client name to get health info for"
+                                }
+                            },
+                            "required": ["client_id"]
+                        }
+                    }
                 }
         ]
     def _truncate_string(self, s: str, max_len: int = 4000) -> str:
@@ -348,6 +365,13 @@ class AICommandCenter:
                     self.last_logs_request_days[cid] = days
                 except Exception:
                     pass
+
+            # If only one client, show progress automatically
+            if len(results) == 1:
+                cmd_id = list(results.values())[0]["command_id"]
+                if cmd_id:
+                    progress_info = await self._monitor_command_progress(cmd_id, client_id)
+                    return {"success": True, "message": f"Log collection completed for {client_id}", "progress": progress_info, "clients": results}
 
             return {"success": True, "message": f"Log collection requested from {len(ids)} client(s)", "clients": results}
         except Exception as e:
@@ -503,6 +527,52 @@ class AICommandCenter:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    async def _monitor_command_progress(self, command_id: str, client_name: str) -> Dict[str, Any]:
+        """Monitor command progress and display updates"""
+        import time
+
+        print(f"\n📊 Monitoring progress for {client_name} (command: {command_id[:8]}...)")
+
+        max_wait = 120  # 2 minutes max
+        start_time = time.time()
+        last_progress = -1
+
+        while time.time() - start_time < max_wait:
+            try:
+                status_result = await self.get_command_status(command_id)
+                if not status_result.get("success"):
+                    break
+
+                data = status_result.get("data", {})
+                status = data.get("status", "unknown")
+                progress_data = data.get("progress", {})
+
+                if status == "completed":
+                    print(f"✅ Log collection completed for {client_name}")
+                    return {"status": "completed", "final_progress": progress_data}
+                elif status == "in_progress" and progress_data:
+                    progress_pct = progress_data.get("progress_pct", 0)
+                    files_done = progress_data.get("files_done", 0)
+                    files_total = progress_data.get("files_total", 0)
+                    current_file = progress_data.get("current_file", "")
+
+                    # Only show progress if it changed
+                    if progress_pct != last_progress:
+                        bar_length = 20
+                        filled_length = int(bar_length * progress_pct // 100)
+                        bar = "█" * filled_length + "░" * (bar_length - filled_length)
+                        print(f"\r🔄 [{bar}] {progress_pct}% ({files_done}/{files_total}) {current_file}", end="", flush=True)
+                        last_progress = progress_pct
+
+                time.sleep(1)  # Poll every second
+
+            except Exception as e:
+                print(f"\n❌ Error monitoring progress: {e}")
+                break
+
+        print(f"\n⏰ Progress monitoring timed out after {max_wait} seconds")
+        return {"status": "timeout", "elapsed": time.time() - start_time}
+
     async def get_rules_status(self, client_id: str) -> Dict[str, Any]:
         """Get latest rules status for a client (age, ruleset_id, counts)"""
         try:
@@ -525,6 +595,101 @@ class AICommandCenter:
             s = requests.get(f"{self.hq_url}/rules/status", params={"client_id": actual_client_id}, timeout=30)
             s.raise_for_status()
             return s.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_system_health(self, client_id: str) -> Dict[str, Any]:
+        """Get comprehensive system health information for a client"""
+        try:
+            # Get current clients to find the actual client ID and health data
+            res = requests.get(f"{self.hq_url}/clients", timeout=30)
+            res.raise_for_status()
+            clients = res.json().get('clients', {})
+
+            # Find client by ID or name
+            target_client = None
+            actual_client_id = client_id
+
+            if client_id in clients:
+                target_client = clients[client_id]
+            else:
+                # Look for client by name
+                for cid, client_info in clients.items():
+                    if client_info.get('client_name') == client_id:
+                        target_client = client_info
+                        actual_client_id = cid
+                        break
+
+            if not target_client:
+                return {"success": False, "error": f"Client '{client_id}' not found"}
+
+            # Get system health from the stored data
+            system_health = target_client.get('system_health', {})
+
+            if not system_health:
+                return {"success": False, "error": f"No system health data available for '{client_id}'. Client may need to reconnect."}
+
+            # Format the health data for display
+            health_status = system_health.get('status', 'unknown')
+            if health_status != 'success':
+                return {"success": False, "error": f"System health check failed: {system_health.get('message', 'Unknown error')}"}
+
+            # Extract and format key metrics
+            uptime_data = system_health.get('uptime', {})
+            memory_data = system_health.get('memory', {})
+            disk_data = system_health.get('disk', {})
+            cpu_data = system_health.get('cpu', {})
+
+            # Format uptime
+            uptime_seconds = uptime_data.get('uptime_seconds', 0)
+            uptime_days = uptime_seconds // 86400
+            uptime_hours = (uptime_seconds % 86400) // 3600
+            uptime_minutes = (uptime_seconds % 3600) // 60
+
+            # Format memory
+            memory_total_gb = memory_data.get('total', 0) / (1024**3)
+            memory_used_gb = memory_data.get('used', 0) / (1024**3)
+            memory_percent = memory_data.get('percent', 0)
+
+            # Format disk
+            disk_total_gb = disk_data.get('total', 0) / (1024**3)
+            disk_used_gb = disk_data.get('used', 0) / (1024**3)
+            disk_percent = disk_data.get('percent', 0)
+
+            return {
+                "success": True,
+                "client_id": actual_client_id,
+                "client_name": target_client.get('client_name', 'unknown'),
+                "hostname": target_client.get('hostname', 'unknown'),
+                "last_seen": target_client.get('last_seen', 'unknown'),
+                "connection_type": target_client.get('connection_type', 'unknown'),
+                "health": {
+                    "uptime": {
+                        "days": uptime_days,
+                        "hours": uptime_hours,
+                        "minutes": uptime_minutes,
+                        "total_seconds": uptime_seconds,
+                        "boot_time": uptime_data.get('boot_time', 'unknown')
+                    },
+                    "memory": {
+                        "total_gb": round(memory_total_gb, 2),
+                        "used_gb": round(memory_used_gb, 2),
+                        "percent": round(memory_percent, 1)
+                    },
+                    "disk": {
+                        "total_gb": round(disk_total_gb, 2),
+                        "used_gb": round(disk_used_gb, 2),
+                        "percent": round(disk_percent, 1)
+                    },
+                    "cpu": {
+                        "percent": cpu_data.get('percent', 0),
+                        "cores": cpu_data.get('count', 0)
+                    },
+                    "network_interfaces": len(system_health.get('network', {})),
+                    "timestamp": system_health.get('timestamp', 'unknown')
+                }
+            }
+
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -722,6 +887,8 @@ class AICommandCenter:
                 return await self.get_firewall_rules(arguments['client_id'])
             elif function_name == "get_rules_status":
                 return await self.get_rules_status(arguments['client_id'])
+            elif function_name == "get_system_health":
+                return await self.get_system_health(arguments['client_id'])
             elif function_name == "query_cached_rules":
                 return await self.query_cached_rules(arguments['client_id'], arguments['query'])
             elif function_name == "push_rules":

@@ -35,6 +35,7 @@ class RegisterRequest(BaseModel):
     client_id: str
     client_name: Optional[str] = None
     hostname: Optional[str] = None
+    system_health: Optional[Dict[str, Any]] = None
 
 class HeartbeatRequest(BaseModel):
     client_id: str
@@ -127,12 +128,14 @@ async def register_client(req: RegisterRequest):
     client_id = req.client_id
     client_name = req.client_name or f"firewall-{client_id[:8]}"
     hostname = req.hostname or "unknown"
+    system_health = req.system_health or {}
 
     clients_live[client_id] = {
         "client_name": client_name,
         "hostname": hostname,
         "last_seen": datetime.now().isoformat(),
-        "connected_at": datetime.now().isoformat()
+        "connected_at": datetime.now().isoformat(),
+        "system_health": system_health
     }
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -413,6 +416,7 @@ async def websocket_endpoint(websocket: WebSocket):
             client_id = message.get("client_id")
             client_name = message.get("client_name", f"firewall-{client_id[:8]}")
             hostname = message.get("hostname", "unknown")
+            system_health = message.get("system_health", {})
 
             if not client_id:
                 await websocket.send_text(json.dumps({
@@ -421,13 +425,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 }))
                 return
 
-            # Register client
+            # Register client with system health
             clients_live[client_id] = {
                 "client_name": client_name,
                 "hostname": hostname,
                 "last_seen": datetime.now().isoformat(),
                 "connected_at": datetime.now().isoformat(),
-                "connection_type": "websocket"
+                "connection_type": "websocket",
+                "system_health": system_health
             }
 
             # Store WebSocket connection
