@@ -182,14 +182,22 @@ async def post_response(resp: CommandResponse):
             ))
             await db.commit()
 
-    # Store command completion
+    # Update command status/progress
     if command_id:
+        is_progress = isinstance(data, dict) and (data.get('status') in ('in_progress', 'progress') or 'progress_pct' in data or 'files_done' in data)
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute('''
-                UPDATE commands
-                SET completed_at=?, status=?, response_data=?
-                WHERE id=?
-            ''', (datetime.now(), data.get('status', 'unknown'), json.dumps(data), command_id))
+            if is_progress:
+                await db.execute('''
+                    UPDATE commands
+                    SET status=?, response_data=?
+                    WHERE id=?
+                ''', ('in_progress', json.dumps(data), command_id))
+            else:
+                await db.execute('''
+                    UPDATE commands
+                    SET completed_at=?, status=?, response_data=?
+                    WHERE id=?
+                ''', (datetime.now(), data.get('status', 'unknown'), json.dumps(data), command_id))
             await db.commit()
 
     return {"ok": True}
@@ -235,6 +243,31 @@ async def server_status():
         "websocket_clients": len(websocket_connections),
         "server_time": datetime.now().isoformat()
     }
+
+@app.get("/command/status")
+async def command_status(command_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute('''
+            SELECT id, client_id, command_type, created_at, completed_at, status, response_data
+            FROM commands WHERE id = ?
+        ''', (command_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Command not found")
+        id_, client_id, command_type, created_at, completed_at, status, response_data = row
+        try:
+            progress = json.loads(response_data) if response_data else None
+        except Exception:
+            progress = None
+        return {
+            "command_id": id_,
+            "client_id": client_id,
+            "command_type": command_type,
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at) if created_at else None,
+            "completed_at": completed_at.isoformat() if hasattr(completed_at, "isoformat") else str(completed_at) if completed_at else None,
+            "status": status,
+            "progress": progress
+        }
 
 # WebSocket endpoint
 @app.post("/rules/ingest")
@@ -449,19 +482,27 @@ async def websocket_endpoint(websocket: WebSocket):
                             "timestamp": datetime.now().isoformat()
                         }))
 
+                    elif message.get("type") == "progress":
+                        # Handle incremental progress update
+                        command_id = message.get("command_id")
+                        progress_data = message.get("data", {})
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute('''
+                                UPDATE commands SET status=?, response_data=?
+                                WHERE id=?
+                            ''', ('in_progress', json.dumps(progress_data), command_id))
+                            await db.commit()
+
                     elif message.get("type") == "response":
-                        # Handle command response
+                        # Handle command final response
                         command_id = message.get("command_id")
                         response_data = message.get("data", {})
-
-                        # Store response in database
                         async with aiosqlite.connect(DB_PATH) as db:
                             await db.execute('''
                                 UPDATE commands SET status=?, response_data=?, completed_at=?
                                 WHERE id=?
                             ''', ('completed', json.dumps(response_data), datetime.now(), command_id))
                             await db.commit()
-
                         print(f"📨 Received response from {client_id} for command {command_id}")
 
                 except WebSocketDisconnect:

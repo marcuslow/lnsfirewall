@@ -93,6 +93,21 @@ class AICommandCenter:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_command_status",
+                    "description": "Get the current status/progress of a previously enqueued command by command_id",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command_id": {"type": "string", "description": "Command ID returned by a previous request"}
+                        },
+                        "required": ["command_id"]
+                    }
+                }
+            },
+
+            {
+                "type": "function",
+                "function": {
                     "name": "get_firewall_rules",
                     "description": "Get firewall rules from a client (uses cache if recent, fetches fresh if needed). Use this for initial rule retrieval.",
                     "parameters": {
@@ -319,6 +334,9 @@ class AICommandCenter:
                         not_found.append(cid)
                 if not_found:
                     return {"success": False, "error": f"Clients not found: {not_found}. Available: {list(clients.keys())}"}
+
+
+
                 ids = norm_ids
 
             results = {}
@@ -351,6 +369,9 @@ class AICommandCenter:
                     if client_info.get('client_name') == client_id:
                         actual_client_id = cid
                         logger.info(f"Mapped client name '{client_id}' to actual client ID '{actual_client_id}'")
+
+
+
                         break
                 else:
                     return {"success": False, "error": f"Client '{client_id}' not found"}
@@ -463,6 +484,25 @@ class AICommandCenter:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+
+    async def get_command_status(self, command_id: str) -> Dict[str, Any]:
+        """Query HQ for the status/progress of a command"""
+        try:
+            res = requests.get(f"{self.hq_url}/command/status", params={"command_id": command_id}, timeout=15)
+            if res.status_code != 200:
+                return {"success": False, "error": f"Server returned {res.status_code}: {res.text}"}
+            data = res.json()
+            # Sanitize potentially large fields
+            if isinstance(data, dict) and isinstance(data.get("progress"), dict):
+                p = dict(data["progress"])  # copy
+                # Remove any raw logs if accidentally present
+                if "logs" in p:
+                    p["logs"] = "[omitted]"
+                data["progress"] = p
+            return {"success": True, "data": data}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     async def get_rules_status(self, client_id: str) -> Dict[str, Any]:
         """Get latest rules status for a client (age, ruleset_id, counts)"""
         try:
@@ -478,6 +518,9 @@ class AICommandCenter:
                         break
                 else:
                     return {"success": False, "error": f"Client '{client_id}' not found"}
+
+
+
             # Fetch status
             s = requests.get(f"{self.hq_url}/rules/status", params={"client_id": actual_client_id}, timeout=30)
             s.raise_for_status()
@@ -500,6 +543,9 @@ class AICommandCenter:
                 for cid, client_info in clients.items():
                     if client_info.get('client_name') == client_id:
                         actual_client_id = cid
+
+
+
                         break
                 else:
                     return {"success": False, "error": f"Client '{client_id}' not found"}
@@ -670,6 +716,8 @@ class AICommandCenter:
                     arguments['client_id'],
                     arguments['days']
                 )
+            elif function_name == "get_command_status":
+                return await self.get_command_status(arguments['command_id'])
             elif function_name == "get_firewall_rules":
                 return await self.get_firewall_rules(arguments['client_id'])
             elif function_name == "get_rules_status":
