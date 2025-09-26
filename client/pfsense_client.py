@@ -245,7 +245,7 @@ class PfSenseClient:
 
         try:
             if cmd_type == 'get_logs':
-                return await self.get_firewall_logs(command.get('params', {}))
+                return await self.get_firewall_logs(command.get('params', {}), cmd_id)
             elif cmd_type == 'get_status':
                 return await self.get_system_status()
             elif cmd_type == 'get_rules':
@@ -262,8 +262,8 @@ class PfSenseClient:
             logger.error(f"Error handling command {cmd_type}: {e}")
             return {'status': 'error', 'message': str(e)}
 
-    async def get_firewall_logs(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Collect firewall logs from specified date range"""
+    async def get_firewall_logs(self, params: Dict[str, Any], command_id: Optional[str] = None) -> Dict[str, Any]:
+        """Collect firewall logs from specified date range and stream progress back to HQ"""
         try:
             days = params.get('days', 90)
             max_days = min(days, 90)  # Limit to 90 days max
@@ -289,11 +289,32 @@ class PfSenseClient:
             logs_data = []
             total_size = 0
 
-            for log_file in log_files:
+            total_files = len(log_files)
+            for idx, log_file in enumerate(log_files, start=1):
                 if os.path.exists(log_file):
                     file_logs = self.parse_log_file(log_file, start_date)
                     logs_data.extend(file_logs)
                     total_size += os.path.getsize(log_file)
+
+                # Send progress update to HQ via WebSocket (if available)
+                if command_id and self.websocket:
+                    progress_pct = int((idx / total_files) * 100) if total_files else 100
+                    try:
+                        await self.send_message({
+                            "type": "progress",
+                            "command_id": command_id,
+                            "data": {
+                                "status": "in_progress",
+                                "stage": "parsing_logs",
+                                "current_file": os.path.basename(log_file),
+                                "files_done": idx,
+                                "files_total": total_files,
+                                "progress_pct": progress_pct,
+                                "timestamp": datetime.now().isoformat()
+                            }
+                        })
+                    except Exception as e:
+                        logger.debug(f"Failed to send progress update: {e}")
 
             # Sort by timestamp
             logs_data.sort(key=lambda x: x.get('timestamp', ''))

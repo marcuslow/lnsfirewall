@@ -68,7 +68,7 @@ fi
 
 # Create service script for pfSense
 echo "🔧 Creating service script..."
-cat > /usr/local/etc/rc.d/pfsense_client << EOF
+cat > /usr/local/etc/rc.d/pfsense_client << 'EOF'
 #!/bin/sh
 
 # PROVIDE: pfsense_client
@@ -80,7 +80,7 @@ cat > /usr/local/etc/rc.d/pfsense_client << EOF
 name="pfsense_client"
 rcvar="pfsense_client_enable"
 
-command="\$(which ${PYTHON_CMD})"
+command="$(which PYTHON_CMD_PLACEHOLDER)"
 command_args="/usr/local/bin/pfsense_client.py --daemon"
 pidfile="/var/run/pfsense_client.pid"
 
@@ -105,6 +105,9 @@ pfsense_client_stop()
 load_rc_config $name
 run_rc_command "$1"
 EOF
+
+# Replace the placeholder with the actual Python command
+sed -i '' "s/PYTHON_CMD_PLACEHOLDER/${PYTHON_CMD}/g" /usr/local/etc/rc.d/pfsense_client
 
 chmod +x /usr/local/etc/rc.d/pfsense_client
 

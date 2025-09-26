@@ -43,7 +43,8 @@ $Files = @(
   @{ Src = "client/pfsense_client.py";      Dest = "client/pfsense_client.py" },
   @{ Src = "client/psutil_stub.py";         Dest = "client/psutil_stub.py" },
   @{ Src = "config/client_config.yaml";     Dest = "config/client_config.yaml" },
-  @{ Src = "setup_client.sh";               Dest = "setup_client.sh" }
+  @{ Src = "setup_client.sh";               Dest = "setup_client.sh" },
+  @{ Src = "restart_client.sh";             Dest = "restart_client.sh" }
 )
 
 Write-Host "Creating bundle staging at: $StagingRoot" -ForegroundColor Cyan
