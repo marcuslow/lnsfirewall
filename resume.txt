@@ -1,0 +1,87 @@
+# pfSense Firewall Management System - Resume Notes
+
+## Current Status
+- **System**: pfSense client "opus-1" connected to HQ server via WebSocket
+- **AI Console**: Working with Rules Query Engine (RQE) and new Logs Query Engine (LQE)
+- **Last Commit**: 65fe55c - "LQE: fix field mapping for pfBlockerNG logs"
+
+## What We Found
+
+### 1. Log Collection Issue
+- **Problem**: AI console showed "0 entries" when querying logs
+- **Root Cause**: Field mapping mismatch between client and LQE
+  - Client sends: `source_ip`, `dest_ip`, `protocol`, `source_port`, `dest_port`
+  - LQE expected: `src`, `dst`, `proto`, `src_port`, `dst_port`
+
+### 2. pfSense Logging Status
+- **Filter logs**: MISSING - `/var/log/filter.log` doesn't exist (firewall logging disabled)
+- **pfBlockerNG logs**: PRESENT - `/var/log/pfblockerng/ip_block.log` has blocked connections
+- **Sample data**: Shows blocked attempts on ports 17001, 2375, 12319, 3389, 9213
+
+### 3. AI Behavior Issues
+- AI was defaulting to 7 days instead of remembering requested window (3 days)
+- AI was calling wrong tools ("request_client_logs" instead of "get_stored_logs")
+
+## What Was Fixed
+
+### 1. LQE Field Mapping (hq/lqe.py)
+- Added `LogEntry.from_dict()` method to handle multiple field naming conventions
+- Maps both pfBlockerNG format and future filter log format
+- Removed duplicate `_normalize()` method
+
+### 2. AI Memory Enhancement (hq/ai_command_center.py)
+- Added `last_logs_request_days` dictionary to remember requested windows per client
+- Modified `query_logs()` to use remembered window instead of defaulting to 7 days
+- Fixed tool parameter passing to respect user-specified timeframes
+
+### 3. Syntax and Testing
+- All modules compile successfully
+- LQE smoke test passes (2 blocked, 2 allowed from sample data)
+- Ready for real data testing
+
+## What Needs Testing
+
+### 1. Immediate Test (pfBlockerNG logs only)
+1. **Restart AI console** to pick up changes
+2. **Request logs**: "Get me 3 days log opus-1"
+3. **Wait 30-60 seconds** for collection
+4. **Query blocked**: "How many blocked connections on opus-1?"
+5. **Expected**: Should show actual blocked counts from pfBlockerNG (not 0)
+
+### 2. Enable pfSense Filter Logging
+1. **Web GUI**: https://103.26.150.122
+2. **Navigate**: Status → System Logs → Settings
+3. **Enable**: 
+   - ✅ "Log firewall default blocks"
+   - ✅ "Log packets matched by firewall rules"
+4. **Save** and generate test traffic
+5. **Verify**: `ls -la /var/log/filter.log*` should show files
+6. **Test**: Request logs again, should see both pfBlockerNG and filter entries
+
+### 3. Comprehensive Testing
+- Test various queries: "ssh logs", "port 80", "IP 192.168.x.x"
+- Verify window memory: request 3 days, then query without specifying days
+- Test with mixed log sources (pfBlockerNG + filter logs)
+
+## SSH Access
+- **File**: `ssh_pfsense.bat` (created for easy access)
+- **IP**: 103.26.150.122
+- **User**: admin
+- **Password**: Lns12345678()
+
+## Key Files Modified
+- `hq/lqe.py` - Log Query Engine with field mapping fix
+- `hq/ai_command_center.py` - Enhanced memory and tool behavior
+- `tests/lqe_smoke.py` - Offline testing script
+
+## Expected Outcome
+After testing, the AI should correctly:
+1. Remember requested log windows (3 days vs 7 days)
+2. Find and analyze pfBlockerNG blocked connections
+3. Handle both pfBlockerNG and filter log formats seamlessly
+4. Provide accurate counts and summaries without sending raw logs to AI models
+
+## Next Session Commands
+1. Read this file: "Get context from resume.txt"
+2. Test immediately: "Get me 3 days log opus-1" then "How many blocked connections?"
+3. If working, enable filter logging and retest

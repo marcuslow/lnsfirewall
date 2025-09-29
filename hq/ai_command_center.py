@@ -30,9 +30,9 @@ try:
 except Exception:
     LogQueryEngine = None
 
-# Configure logging
+# Configure logging (will be reconfigured in main() based on verbose flag)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # Default to WARNING to hide debug info
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -42,10 +42,11 @@ DEFAULT_DB_PATH = os.getenv('HQ_DB_PATH', os.path.join(BASE_DIR, 'hq_database.db
 
 
 class AICommandCenter:
-    def __init__(self, hq_url: str, openai_api_key: str, db_path: str = DEFAULT_DB_PATH):
+    def __init__(self, hq_url: str, openai_api_key: str, db_path: str = DEFAULT_DB_PATH, verbose: bool = False):
         self.hq_url = hq_url.rstrip('/')
         self.db_path = db_path or DEFAULT_DB_PATH
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
+        self.verbose = verbose
         self.conversation_history = []
         # Remember last requested logs window per client for better defaults
         self.last_logs_request_days: Dict[str, int] = {}
@@ -210,6 +211,36 @@ class AICommandCenter:
                                     "type": "string",
                                     "description": "Client ID or client name to get health info for"
                                 }
+                            },
+                            "required": ["client_id"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "perform_risk_assessment",
+                        "description": "Perform a comprehensive security risk assessment on a client: checks health, ensures recent logs, analyzes for threats (blocked events, brute-force, anomalies), and provides a structured report.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "client_id": {"type": "string", "description": "Client ID or name"},
+                                "days": {"type": "integer", "description": "Log lookback days (default: 7)", "default": 7},
+                                "force_refresh": {"type": "boolean", "description": "Force fresh log request (default: False)", "default": False}
+                            },
+                            "required": ["client_id"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_logs_status",
+                        "description": "Check log recency and status for a client to determine if fresh logs are needed",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "client_id": {"type": "string", "description": "Client ID or name"}
                             },
                             "required": ["client_id"]
                         }
@@ -911,6 +942,14 @@ class AICommandCenter:
                     arguments.get('days'),
                     arguments.get('top_n')
                 )
+            elif function_name == "perform_risk_assessment":
+                return await self.perform_risk_assessment(
+                    arguments['client_id'],
+                    arguments.get('days', 7),
+                    arguments.get('force_refresh', False)
+                )
+            elif function_name == "get_logs_status":
+                return await self.get_logs_status(arguments['client_id'])
 
             else:
                 return {"success": False, "error": f"Unknown function: {function_name}"}
@@ -993,6 +1032,56 @@ class AICommandCenter:
                 frag = m.group(1) if m else ''
                 hits = lqe.filter_by_ip_fragment(frag) if frag else []
                 results = {'ip_fragment': frag, 'count': len(hits), 'examples': compact(hits)}
+            elif any(k in q for k in ['risk', 'assessment', 'threat', 'security check', 'anomaly']):
+                # Risk assessment: aggregate multiple analyses for comprehensive view
+                summary = lqe.summarize(top_n=effective_top_n)
+                blocked = lqe.filter_blocked()
+                allowed = lqe.filter_allowed()
+                ssh_hits = lqe.filter_by_service('ssh')  # Potential brute-force
+                http_hits = lqe.filter_by_service('http')  # Web attacks
+                https_hits = lqe.filter_by_service('https')  # Secure web traffic
+
+                # Use enhanced LQE methods for better detection
+                potential_brute = lqe.detect_brute_force(threshold=5)
+                port_scans = lqe.detect_port_scans(threshold=10)
+                top_blocked_ips = lqe.get_top_blocked_ips(top_n=effective_top_n)
+
+                # Simple risk scoring heuristic
+                blocked_count = len(blocked)
+                brute_force_count = len(potential_brute)
+                port_scan_count = len(port_scans)
+
+                if blocked_count > 100 or brute_force_count > 10 or port_scan_count > 20:
+                    risk_level = 'High'
+                elif blocked_count > 10 or brute_force_count > 0 or port_scan_count > 5:
+                    risk_level = 'Medium'
+                else:
+                    risk_level = 'Low'
+
+                # Generate recommendations
+                recommendations = []
+                if brute_force_count > 0:
+                    recommendations.append('Block top suspicious IPs if recurring')
+                    recommendations.append('Review rules for authentication ports (SSH, RDP)')
+                if port_scan_count > 0:
+                    recommendations.append('Investigate potential port scanning activity')
+                if blocked_count > 50:
+                    recommendations.append('Consider rate limiting or additional blocking rules')
+                if top_blocked_ips and top_blocked_ips[0][1] > 20:
+                    recommendations.append(f'Investigate top blocked IP: {top_blocked_ips[0][0]} ({top_blocked_ips[0][1]} blocks)')
+
+                results = {
+                    'risk_summary': summary,
+                    'blocked_events': {'count': len(blocked), 'examples': compact(blocked)},
+                    'allowed_events': {'count': len(allowed), 'examples': compact(allowed)},
+                    'potential_brute_force': {'count': brute_force_count, 'examples': compact(potential_brute)},
+                    'potential_port_scans': {'count': port_scan_count, 'examples': compact(port_scans)},
+                    'web_traffic': {'http_count': len(http_hits), 'https_count': len(https_hits)},
+                    'top_blocked_ips': top_blocked_ips,
+                    'risk_level': risk_level,
+                    'recommendations': recommendations,
+                    'analysis_period_days': effective_days
+                }
             else:
                 results = {'summary': lqe.summarize(top_n=effective_top_n)}
 
@@ -1006,6 +1095,135 @@ class AICommandCenter:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+    async def perform_risk_assessment(self, client_id: str, days: int = 7, force_refresh: bool = False) -> Dict[str, Any]:
+        """Perform comprehensive security risk assessment on a client"""
+        try:
+            # Step 1: Get system health
+            health = await self.get_client_status(client_id)
+            if not health.get('success'):
+                return health  # Propagate error
+
+            # Step 2: Check for recent logs (e.g., last ingestion within 1 day)
+            async with aiosqlite.connect(self.db_path) as db:
+                # Map provided name -> actual ID as needed
+                actual_client_id = client_id
+                try:
+                    res = requests.get(f"{self.hq_url}/clients", timeout=30)
+                    res.raise_for_status()
+                    clients = res.json().get('clients', {})
+                    name_to_id = {v.get('client_name', ''): k for k, v in clients.items()}
+                    if client_id in name_to_id:
+                        actual_client_id = name_to_id[client_id]
+                except Exception:
+                    pass
+
+                cursor = await db.execute("SELECT MAX(timestamp) FROM logs WHERE client_id = ?", (actual_client_id,))
+                row = await cursor.fetchone()
+                last_log_ts = row[0] if row and row[0] else None
+                last_log_dt = datetime.fromisoformat(last_log_ts) if last_log_ts else None
+
+            # Step 3: Request fresh logs if needed
+            if force_refresh or not last_log_dt or (datetime.now() - last_log_dt) > timedelta(days=1):
+                log_req = await self.request_client_logs(client_id, days)
+                if not log_req.get('success'):
+                    return log_req
+                # Note: In production, you might want to wait for completion here
+                # For now, we'll proceed with existing logs and note if refresh was attempted
+
+            # Step 4: Query logs for risk indicators
+            risk_query = await self.query_logs(client_id, 'risk assessment', days=days, top_n=10)
+            if not risk_query.get('success'):
+                return risk_query
+
+            # Step 5: Synthesize assessment
+            results = risk_query['results']
+            health_data = health.get('data', {})
+
+            # Extract key metrics
+            blocked_count = results.get('blocked_events', {}).get('count', 0)
+            brute_force_count = results.get('potential_brute_force', {}).get('count', 0)
+            top_blocked_ips = results.get('top_blocked_ips', [])
+            risk_level = results.get('risk_level', 'Unknown')
+
+            # Generate comprehensive findings
+            key_findings = [
+                f"Blocked events: {blocked_count}",
+                f"Potential brute-force attempts: {brute_force_count}",
+                f"Risk level: {risk_level}"
+            ]
+
+            if top_blocked_ips:
+                key_findings.append(f"Top blocked IP: {top_blocked_ips[0][0]} ({top_blocked_ips[0][1]} blocks)")
+
+            # System health findings
+            if isinstance(health_data, dict):
+                memory_usage = health_data.get('memory_usage_percent', 0)
+                disk_usage = health_data.get('disk_usage_percent', 0)
+                if memory_usage > 80:
+                    key_findings.append(f"High memory usage: {memory_usage}%")
+                if disk_usage > 80:
+                    key_findings.append(f"High disk usage: {disk_usage}%")
+
+            assessment = {
+                'client_id': actual_client_id,
+                'assessment_time': datetime.now().isoformat(),
+                'analysis_period_days': days,
+                'system_health': health_data,
+                'log_analysis': results,
+                'risk_level': risk_level,
+                'key_findings': key_findings,
+                'recommendations': results.get('recommendations', []),
+                'log_freshness': {
+                    'last_log_time': last_log_ts,
+                    'refresh_attempted': force_refresh or (not last_log_dt or (datetime.now() - last_log_dt) > timedelta(days=1))
+                }
+            }
+
+            return {'success': True, 'assessment': assessment}
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    async def get_logs_status(self, client_id: str) -> Dict[str, Any]:
+        """Check log recency and status for a client"""
+        try:
+            # Map provided name -> actual ID as needed
+            actual_client_id = client_id
+            try:
+                res = requests.get(f"{self.hq_url}/clients", timeout=30)
+                res.raise_for_status()
+                clients = res.json().get('clients', {})
+                name_to_id = {v.get('client_name', ''): k for k, v in clients.items()}
+                if client_id in name_to_id:
+                    actual_client_id = name_to_id[client_id]
+            except Exception:
+                pass
+
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("""
+                    SELECT timestamp, size_bytes, compressed, COUNT(*) as log_count
+                    FROM logs WHERE client_id = ?
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (actual_client_id,))
+                row = await cursor.fetchone()
+
+                if not row or not row[0]:
+                    return {'success': False, 'error': 'No logs found for client'}
+
+                ts, size, compressed, log_count = row
+                age_hours = (datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 3600
+
+                return {
+                    'success': True,
+                    'client_id': actual_client_id,
+                    'last_ingested': ts,
+                    'age_hours': age_hours,
+                    'size_bytes': size,
+                    'compressed': bool(compressed),
+                    'total_log_entries': log_count
+                }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
 
     async def chat_with_ai(self, user_message: str) -> str:
         """Chat with AI assistant for firewall management"""
@@ -1027,14 +1245,24 @@ class AICommandCenter:
    - pfBlockerNG logs (IP blocking, threat intelligence)
    - System logs (general system events)
 3. Get and update firewall rules
-4. Restart firewall services
+4. Restart firewall services when needed
 5. Retrieve previously stored logs from the database
+6. Query stored logs for summaries, filtered events (e.g., blocked, by port/service/IP)
 
 Log Analysis Capabilities:
 - Parse pfSense filter logs with rule numbers, interfaces, actions, protocols, IPs
 - Parse pfBlockerNG logs with block lists, threat categories, source/destination details
 - Generate statistics: blocked vs allowed connections, top source/destination IPs, protocol distribution
 - Track security events and potential threats
+
+Risk Assessment Capabilities:
+- When asked for a risk assessment, threat analysis, or security check:
+  - First, check system health with get_client_status.
+  - Ensure recent logs are available (e.g., request_client_logs if logs are older than 1 day).
+  - Use query_logs with targeted queries like 'summary', 'blocked', 'ssh' (for brute-force), 'top blocked IPs', or custom (e.g., 'multiple blocks from same IP on port 22').
+  - Analyze for common risks: high blocked traffic (potential attacks), repeated failures on auth ports (brute-force), unusual protocols/ports, top suspicious IPs (e.g., many connections from one source indicating DDoS or scanning).
+  - Provide a structured assessment: Low/Medium/High risk level, key findings, recommendations (e.g., block IP, update rules).
+  - Prioritize accuracy; if data is insufficient, request more logs or clarification.
 
 When users ask about firewall management, use the appropriate functions to help them. Always be clear about what actions you're taking and ask for confirmation before making changes that could affect firewall security or connectivity.
 
@@ -1095,7 +1323,8 @@ Be helpful, informative, and prioritize security in all recommendations. When an
                     function_name = tool_call.function.name
                     arguments = json.loads(tool_call.function.arguments)
 
-                    logger.info(f"Executing function: {function_name} with args: {arguments}")
+                    if self.verbose:
+                        logger.info(f"Executing function: {function_name} with args: {arguments}")
 
                     result = await self.execute_function_call(function_name, arguments)
 
@@ -1156,8 +1385,20 @@ async def main():
     parser.add_argument('--openai-key', help='OpenAI API key (can also be set via OPENAI_API_KEY env var)')
     parser.add_argument('--hq-url', default=os.getenv('HQ_URL', 'http://localhost:8000'), help='HTTP HQ base URL (e.g., https://lnsfirewall.ngrok.app)')
     parser.add_argument('--db', default=DEFAULT_DB_PATH, help='Database file path')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging (shows HTTP requests and function calls)')
 
     args = parser.parse_args()
+
+    # Configure logging based on verbose flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+        logging.getLogger('httpx').setLevel(logging.INFO)
+        logging.getLogger(__name__).setLevel(logging.INFO)
+    else:
+        # Hide debug/info logs by default
+        logging.getLogger().setLevel(logging.WARNING)
+        logging.getLogger('httpx').setLevel(logging.WARNING)
+        logging.getLogger(__name__).setLevel(logging.WARNING)
 
     # Get OpenAI API key from args or environment
     openai_key = args.openai_key or os.getenv('OPENAI_API_KEY')
@@ -1170,7 +1411,7 @@ async def main():
         return
 
     # Create AI Command Center (HTTP mode)
-    ai_center = AICommandCenter(args.hq_url, openai_key, args.db)
+    ai_center = AICommandCenter(args.hq_url, openai_key, args.db, args.verbose)
 
     print("🔥 AI Firewall Command Center Started 🔥")
     print("Type 'help' for available commands, 'quit' to exit")
