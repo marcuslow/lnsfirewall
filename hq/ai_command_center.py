@@ -245,6 +245,21 @@ class AICommandCenter:
                             "required": ["client_id"]
                         }
                     }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "update_client",
+                        "description": "Push client software update to a pfSense firewall. Creates bundle, uploads files, and restarts client remotely.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "client_id": {"type": "string", "description": "Client ID or name to update"},
+                                "force_restart": {"type": "boolean", "description": "Force restart even if update fails (default: False)", "default": False}
+                            },
+                            "required": ["client_id"]
+                        }
+                    }
                 }
         ]
     def _truncate_string(self, s: str, max_len: int = 4000) -> str:
@@ -261,12 +276,14 @@ class AICommandCenter:
             if isinstance(result, dict):
                 # Copy and truncate potentially large fields
                 res = dict(result)
-                big_fields = [
-                    'rules_xml', 'config_xml', 'log_data', 'content', 'data'
+                # Only truncate truly massive fields, preserve analysis results
+                massive_fields = [
+                    'rules_xml', 'config_xml', 'raw_logs'  # Removed 'log_data', 'content', 'data', 'entries'
                 ]
-                for f in big_fields:
+                for f in massive_fields:
                     if f in res and isinstance(res[f], str):
-                        res[f] = self._truncate_string(res[f], 4000)
+                        res[f] = self._truncate_string(res[f], 2000)
+
                 # Never include raw log entries in AI context; summarize instead
                 if 'logs' in res and isinstance(res['logs'], list):
                     summarized_logs = []
@@ -285,22 +302,125 @@ class AICommandCenter:
                     # Include totals if present
                     if 'total_entries' in res:
                         res['total_entries'] = total_entries
-                # As a safeguard, cap overall JSON size
+
+                # Preserve query_logs results - these are already processed summaries
+                is_query_result = any(key in res for key in ['summary', 'blocked_count', 'allowed_count', 'service', 'top_ips', 'top_ports'])
+
+                if not is_query_result:
+                    # Remove large arrays only for non-query results
+                    for key in list(res.keys()):
+                        if isinstance(res[key], list) and len(res[key]) > 20:
+                            res[key] = f"[{len(res[key])} items - truncated for context]"
+
+                # More lenient size limit for query results (risk assessments)
+                size_limit = 8000 if is_query_result else 3000
                 payload = json.dumps(res)
-                if len(payload) > 6000:
-                    # Keep only keys and sizes
-                    summary = {k: (len(v) if isinstance(v, str) else v) for k, v in res.items()}
-                    return {
-                        'success': res.get('success', True),
-                        'note': 'Payload truncated for AI context limits',
-                        'summary': summary
-                    }
+                if len(payload) > size_limit:
+                    if is_query_result:
+                        # For query results, just truncate examples but keep summaries
+                        if 'examples' in res and isinstance(res['examples'], list):
+                            res['examples'] = res['examples'][:5]  # Keep first 5 examples
+                        return res
+                    else:
+                        # Keep only essential keys for non-query results
+                        summary = {
+                            'success': res.get('success', True),
+                            'message': res.get('message', ''),
+                            'command_id': res.get('command_id', ''),
+                            'note': f'Payload truncated for AI context limits (was {len(payload)} chars)'
+                        }
+                        # Add specific summaries for known result types
+                        if 'total_entries' in res:
+                            summary['total_log_entries'] = res['total_entries']
+                        if 'updated_files' in res:
+                            summary['files_updated'] = len(res['updated_files']) if isinstance(res['updated_files'], list) else 'yes'
+                        return summary
                 return res
             return result
         except Exception:
             return {'success': False, 'note': 'Failed to sanitize tool result'}
 
+    def _compress_message_to_keywords(self, message: Dict[str, Any]) -> str:
+        """Compress a conversation message to essential keywords."""
+        role = message.get('role', '')
+        content = message.get('content', '') or ''
 
+        # Handle None content
+        if content is None:
+            content = ''
+
+        if role == 'user':
+            # Extract action verbs and key nouns from user input
+            import re
+            # Common firewall management actions
+            actions = re.findall(r'\b(update|restart|get|check|analyze|risk|assessment|status|logs|rules|block|allow|monitor)\b', str(content).lower())
+            # Client names and identifiers
+            clients = re.findall(r'\b(opus-\d+|[\w-]+office|[\w-]+client|all)\b', str(content).lower())
+            # Time/quantity indicators
+            timeframes = re.findall(r'\b(\d+\s*days?|today|yesterday|week|month)\b', str(content).lower())
+
+            keywords = []
+            if actions: keywords.append(f"action:{','.join(set(actions))}")
+            if clients: keywords.append(f"target:{','.join(set(clients))}")
+            if timeframes: keywords.append(f"time:{','.join(set(timeframes))}")
+
+            return f"user: {' | '.join(keywords)}" if keywords else f"user: {str(content)[:50]}"
+
+        elif role == 'assistant':
+            # Extract key outcomes from assistant responses
+            content_str = str(content).lower()
+            if 'successfully' in content_str or 'completed' in content_str:
+                return "assistant: success"
+            elif 'error' in content_str or 'failed' in content_str:
+                return "assistant: error"
+            elif 'monitoring' in content_str or 'progress' in content_str:
+                return "assistant: monitoring"
+            else:
+                return "assistant: response"
+
+        elif role == 'tool':
+            # Summarize tool results
+            try:
+                if content is None:
+                    return "tool: empty"
+                tool_data = json.loads(content) if isinstance(content, str) else content
+                if isinstance(tool_data, dict):
+                    if tool_data.get('success'):
+                        result_type = "success"
+                        if 'total_entries' in tool_data:
+                            result_type += f":logs({tool_data['total_entries']})"
+                        elif 'updated_files' in tool_data:
+                            result_type += ":update"
+                        elif 'clients' in tool_data:
+                            result_type += ":status"
+                        return f"tool: {result_type}"
+                    else:
+                        return "tool: error"
+            except:
+                pass
+            return "tool: result"
+
+        return f"{role}: {str(content)[:30]}"
+
+    def _get_safe_conversation_history(self) -> List[Dict[str, Any]]:
+        """Get conversation history with keyword compression to prevent context overflow."""
+        # Get recent messages and compress them
+        recent_messages = self.conversation_history[-10:]  # Can afford more with compression
+
+        compressed_history = []
+        for msg in recent_messages:
+            # Keep the last 2 messages in full detail for immediate context
+            if len(compressed_history) >= len(recent_messages) - 2:
+                compressed_history.append(msg)
+            else:
+                # Compress older messages to keywords
+                compressed_content = self._compress_message_to_keywords(msg)
+                compressed_history.append({
+                    "role": msg.get('role', 'user'),
+                    "content": compressed_content
+                })
+
+        return compressed_history
 
 
     async def get_client_status(self, client_id: Optional[str] = None) -> Dict[str, Any]:
@@ -559,8 +679,9 @@ class AICommandCenter:
             return {"success": False, "error": str(e)}
 
     async def _monitor_command_progress(self, command_id: str, client_name: str) -> Dict[str, Any]:
-        """Monitor command progress and display updates"""
+        """Monitor command progress and display updates (non-blocking prints)."""
         import time
+        import asyncio
 
         print(f"\n📊 Monitoring progress for {client_name} (command: {command_id[:8]}...)")
 
@@ -577,9 +698,11 @@ class AICommandCenter:
                 data = status_result.get("data", {})
                 status = data.get("status", "unknown")
                 progress_data = data.get("progress", {})
+                cmd_type = data.get("command_type", "command")
 
                 if status == "completed":
-                    print(f"✅ Log collection completed for {client_name}")
+                    label = "Update" if cmd_type == "update_client" else cmd_type.replace("_", " ").title()
+                    print(f"✅ {label} completed for {client_name}")
                     return {"status": "completed", "final_progress": progress_data}
                 elif status == "in_progress" and progress_data:
                     progress_pct = progress_data.get("progress_pct", 0)
@@ -595,7 +718,7 @@ class AICommandCenter:
                         print(f"\r🔄 [{bar}] {progress_pct}% ({files_done}/{files_total}) {current_file}", end="", flush=True)
                         last_progress = progress_pct
 
-                time.sleep(1)  # Poll every second
+                await asyncio.sleep(1)  # Poll every second without blocking
 
             except Exception as e:
                 print(f"\n❌ Error monitoring progress: {e}")
@@ -950,6 +1073,11 @@ class AICommandCenter:
                 )
             elif function_name == "get_logs_status":
                 return await self.get_logs_status(arguments['client_id'])
+            elif function_name == "update_client":
+                return await self.update_client(
+                    arguments['client_id'],
+                    arguments.get('force_restart', False)
+                )
 
             else:
                 return {"success": False, "error": f"Unknown function: {function_name}"}
@@ -1225,6 +1353,101 @@ class AICommandCenter:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+    async def _resolve_client_id(self, client_id: str) -> Optional[str]:
+        """Resolve client name to actual client ID"""
+        try:
+            res = requests.get(f"{self.hq_url}/clients", timeout=30)
+            res.raise_for_status()
+            clients = res.json().get('clients', {})
+            name_to_id = {v.get('client_name', ''): k for k, v in clients.items()}
+            if client_id in name_to_id:
+                return name_to_id[client_id]
+            # If not found by name, assume it's already an ID
+            if client_id in clients:
+                return client_id
+            return None
+        except Exception:
+            # If API call fails, assume client_id is the actual ID
+            return client_id
+
+    async def _send_command(self, client_id: str, command_type: str, params: Dict[str, Any]) -> Optional[str]:
+        """Send a command to a client and return command ID"""
+        try:
+            res = requests.post(f"{self.hq_url}/command", json={
+                "client_id": client_id,
+                "command_type": command_type,
+                "params": params
+            }, timeout=30)
+            res.raise_for_status()
+            result = res.json()
+            return result.get("command_id")
+        except Exception as e:
+            if self.verbose:
+                print(f"Failed to send command: {e}")
+            return None
+
+    async def update_client(self, client_id: str, force_restart: bool = False) -> Dict[str, Any]:
+        """Push client software update over the existing client channel by sending .py files.
+        No SSH required: the client writes files locally and restarts itself.
+        Also auto-monitors the update progress for a single client and reports completion."""
+        try:
+            # Resolve client name to ID
+            resolved_client_id = await self._resolve_client_id(client_id)
+            if not resolved_client_id:
+                return {"success": False, "error": f"Client '{client_id}' not found"}
+
+            # Build files payload from repo
+            repo_root = BASE_DIR
+            files_spec = []
+            file_defs = [
+                ("client/pfsense_client.py", "/usr/local/bin/pfsense_client.py", "0755"),
+                ("client/psutil_stub.py", "/usr/local/bin/psutil_stub.py", "0644")
+            ]
+            for rel_path, target, mode in file_defs:
+                abs_path = os.path.join(repo_root, rel_path)
+                if os.path.exists(abs_path):
+                    with open(abs_path, "rb") as f:
+                        content_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    files_spec.append({
+                        "name": os.path.basename(rel_path),
+                        "path": rel_path,
+                        "target": target,
+                        "mode": mode,
+                        "content_b64": content_b64
+                    })
+
+            if not files_spec:
+                return {"success": False, "error": "No client files found to send"}
+
+            params = {
+                "restart": True,
+                "force_restart": force_restart,
+                "files": files_spec,
+                "timestamp": datetime.now().isoformat(),
+                "strategy": "replace_py"
+            }
+
+            # Send update command to client
+            command_id = await self._send_command(resolved_client_id, "update_client", params)
+            if not command_id:
+                return {"success": False, "error": "Failed to send update command to client"}
+
+            # Auto-monitor progress for single-client update
+            progress_info = await self._monitor_command_progress(command_id, client_id)
+
+            return {
+                "success": True,
+                "command_id": command_id,
+                "message": f"Client update completed for {client_id}" if progress_info.get("status") == "completed" else f"Client update in progress for {client_id}",
+                "progress": progress_info,
+                "details": {
+                    "client_id": resolved_client_id,
+                    "files": [f[0] for f in file_defs]
+                }
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Failed to update client: {str(e)}"}
+
     async def chat_with_ai(self, user_message: str) -> str:
         """Chat with AI assistant for firewall management"""
         try:
@@ -1273,6 +1496,7 @@ Current capabilities:
 - Manage firewall rules
 - Monitor system health and performance
 - Restart firewall services when needed
+- Update client software remotely (push new code, restart services)
 
 Client Addressing:
 - Clients can be addressed by their friendly names (e.g., "opus-1", "branch-office-2") or client IDs
@@ -1280,11 +1504,15 @@ Client Addressing:
 - Use "all" to target all connected clients
 - Always provide helpful error messages if a client name is not found
 
-Be helpful, informative, and prioritize security in all recommendations. When analyzing logs, provide insights about security events, blocked threats, and traffic patterns."""
+Be helpful, informative, and prioritize security in all recommendations. When analyzing logs, provide insights about security events, blocked threats, and traffic patterns.
+
+Behavioral rules for user experience:
+- For single-client software update requests (e.g., "update opus-1"), do NOT ask for confirmation; initiate immediately, auto-monitor progress, and announce completion automatically. Provide the command ID, but do not require the user to manually run a status check.
+- Only ask for confirmation when the request is ambiguous, risky, or targets multiple clients without clear intent."""
             }
 
-            # Prepare messages for OpenAI (limit history to reduce token usage)
-            messages = [system_message] + self.conversation_history[-8:]
+            # Prepare messages for OpenAI (aggressive token management)
+            messages = [system_message] + self._get_safe_conversation_history()
 
             # Make API call to OpenAI
             response = self.openai_client.chat.completions.create(
@@ -1341,7 +1569,7 @@ Be helpful, informative, and prioritize security in all recommendations. When an
                 # Get final response from AI with function results
                 final_response = self.openai_client.chat.completions.create(
                     model="gpt-4",
-                    messages=[system_message] + self.conversation_history[-8:],
+                    messages=[system_message] + self._get_safe_conversation_history(),
                     temperature=0.7,
                     max_tokens=800
                 )

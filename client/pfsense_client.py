@@ -20,6 +20,7 @@ import hashlib
 import gzip
 import shutil
 from glob import glob
+import base64
 
 try:
     import websockets
@@ -256,6 +257,8 @@ class PfSenseClient:
                 return await self.set_firewall_rules(command.get('params', {}))
             elif cmd_type == 'restart_firewall':
                 return await self.restart_firewall()
+            elif cmd_type == 'update_client':
+                return await self.update_client_files(command.get('params', {}))
             elif cmd_type == 'ping':
                 return {'status': 'success', 'message': 'pong', 'timestamp': datetime.now().isoformat()}
             else:
@@ -783,6 +786,68 @@ class PfSenseClient:
             return {'status': 'error', 'message': str(e)}
 
     # HTTP polling methods removed - WebSocket only mode
+
+    async def update_client_files(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Update local client .py files from HQ payload and optionally restart."""
+        try:
+            files = params.get('files', [])
+            if not files:
+                return {"status": "error", "message": "No files provided"}
+
+            updated = []
+            for f in files:
+                name = f.get('name') or os.path.basename(f.get('path', ''))
+                target = f.get('target') or ("/usr/local/bin/" + name)
+                content_b64 = f.get('content_b64')
+                mode = f.get('mode', '0644')
+                if not content_b64:
+                    continue
+                data = base64.b64decode(content_b64)
+                # Ensure dir exists
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # Write atomically
+                tmp_path = target + ".tmp"
+                with open(tmp_path, 'wb') as out:
+                    out.write(data)
+                os.replace(tmp_path, target)
+                # Permissions
+                try:
+                    perm = int(mode, 8)
+                    os.chmod(target, perm)
+                except Exception:
+                    pass
+                updated.append(target)
+
+            # Restart if requested
+            restart = params.get('restart', True)
+            restarted = False
+            if restart:
+                # Prefer restart script if present
+                if os.path.exists('/usr/local/bin/restart_client.sh'):
+                    try:
+                        subprocess.Popen(['sh', '-c', '/usr/local/bin/restart_client.sh >/dev/null 2>&1 &'])
+                        restarted = True
+                    except Exception as e:
+                        logger.error(f"Failed to invoke restart script: {e}")
+                else:
+                    # Fallback: re-exec self as daemon
+                    try:
+                        py = shutil.which('python3') or shutil.which('python') or sys.executable
+                        subprocess.Popen(['sh', '-c', f'nohup {py} /usr/local/bin/pfsense_client.py --daemon >/dev/null 2>&1 &'])
+                        # Exit current process after spawning new one
+                        restarted = True
+                    except Exception as e:
+                        logger.error(f"Failed to re-exec client: {e}")
+
+            return {
+                "status": "success",
+                "updated_files": updated,
+                "restarted": restarted,
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Update failed: {e}")
+            return {"status": "error", "message": str(e)}
 
     async def run(self):
         """Main client loop - WebSocket only"""
