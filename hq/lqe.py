@@ -91,6 +91,41 @@ class LogQueryEngine:
             return []
         return self.filter_by_port(p)
 
+    def detect_brute_force(self, ports: List[int] = None, threshold: int = 5) -> List[LogEntry]:
+        """Detect potential brute-force: multiple blocks from same IP on auth ports"""
+        if ports is None:
+            ports = [22, 3389, 445, 21, 23]  # SSH, RDP, SMB, FTP, Telnet
+
+        blocked = self.filter_blocked()
+        ip_attempts = defaultdict(int)
+
+        # Count attempts per IP on auth ports
+        for entry in blocked:
+            if entry.dst_port in ports and entry.src:
+                ip_attempts[entry.src] += 1
+
+        # Return entries from IPs that exceed threshold
+        suspicious_ips = {ip for ip, count in ip_attempts.items() if count >= threshold}
+        return [entry for entry in blocked if entry.src in suspicious_ips and entry.dst_port in ports]
+
+    def detect_port_scans(self, threshold: int = 10) -> List[LogEntry]:
+        """Detect potential port scans: same IP hitting many different ports"""
+        ip_ports = defaultdict(set)
+
+        for entry in self.entries:
+            if entry.src and entry.dst_port:
+                ip_ports[entry.src].add(entry.dst_port)
+
+        # Find IPs that hit many different ports
+        scanning_ips = {ip for ip, ports in ip_ports.items() if len(ports) >= threshold}
+        return [entry for entry in self.entries if entry.src in scanning_ips]
+
+    def get_top_blocked_ips(self, top_n: int = 10) -> List[Tuple[str, int]]:
+        """Get top IPs by number of blocked connections"""
+        blocked = self.filter_blocked()
+        ip_counts = Counter(entry.src for entry in blocked if entry.src)
+        return ip_counts.most_common(top_n)
+
     # Summaries
     def summarize(self, top_n: int = 10) -> Dict[str, Any]:
         total = len(self.entries)
@@ -125,6 +160,10 @@ class LogQueryEngine:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         start = (datetime.now() - timedelta(days=since_days)).isoformat()
+
+        entries: List[Dict[str, Any]] = []
+
+        # First try the logs table (new storage method)
         if client_id:
             cur.execute(
                 """
@@ -145,7 +184,7 @@ class LogQueryEngine:
                 """,
                 (start,),
             )
-        entries: List[Dict[str, Any]] = []
+
         for log_data, compressed in cur.fetchall():
             if compressed:
                 try:
@@ -160,6 +199,60 @@ class LogQueryEngine:
                     entries.extend(chunk)
             except Exception:
                 continue
+
+        # If no entries found in logs table, try command responses (fallback for existing data)
+        if not entries:
+            if client_id:
+                cur.execute(
+                    """
+                    SELECT response_data
+                    FROM commands
+                    WHERE (client_id = ?) AND (command_type = 'get_logs') AND (status = 'completed') AND (created_at >= ?)
+                    ORDER BY created_at DESC
+                    """,
+                    (client_id, start),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT response_data
+                    FROM commands
+                    WHERE (command_type = 'get_logs') AND (status = 'completed') AND (created_at >= ?)
+                    ORDER BY created_at DESC
+                    """,
+                    (start,),
+                )
+
+            for (response_data,) in cur.fetchall():
+                if response_data:
+                    try:
+                        response = json.loads(response_data)
+                        if isinstance(response, dict) and 'logs' in response:
+                            logs = response['logs']
+                            if isinstance(logs, str):
+                                # Compressed logs
+                                if response.get('compressed', False):
+                                    try:
+                                        payload = gzip.decompress(base64.b64decode(logs.encode("utf-8"))).decode("utf-8")
+                                        chunk = json.loads(payload)
+                                        if isinstance(chunk, list):
+                                            entries.extend(chunk)
+                                    except Exception:
+                                        continue
+                                else:
+                                    # Uncompressed string
+                                    try:
+                                        chunk = json.loads(logs)
+                                        if isinstance(chunk, list):
+                                            entries.extend(chunk)
+                                    except Exception:
+                                        continue
+                            elif isinstance(logs, list):
+                                # Direct list of log entries
+                                entries.extend(logs)
+                    except Exception:
+                        continue
+
         conn.close()
         return LogQueryEngine(entries)
 
