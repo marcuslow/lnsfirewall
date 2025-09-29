@@ -17,6 +17,13 @@ import aiosqlite
 import websockets
 import os
 import hashlib
+import logging
+import sys
+import base64
+
+# Add the hq directory to Python path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from client_updater import ClientUpdater
 
 # Use a single, absolute DB path so AI and server share the same file
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
@@ -30,6 +37,9 @@ commands_queue: Dict[str, List[Dict[str, Any]]] = {}
 
 # WebSocket connections
 websocket_connections: Dict[str, WebSocket] = {}  # client_id -> WebSocket
+
+# Client updater instance
+client_updater = ClientUpdater(BASE_DIR, DB_PATH)
 
 class RegisterRequest(BaseModel):
     client_id: str
@@ -217,6 +227,36 @@ async def create_command(cmd: CreateCommandRequest):
         "timestamp": datetime.now().isoformat()
     }
 
+    # Enrich update_client with files payload if missing
+    if cmd.command_type == "update_client":
+        try:
+            params = command.get("params") or {}
+            files = params.get("files") or []
+            if not files:
+                # Build files from repo
+                file_defs = [
+                    (os.path.join(BASE_DIR, "client", "pfsense_client.py"), "/usr/local/bin/pfsense_client.py", "0755"),
+                    (os.path.join(BASE_DIR, "client", "psutil_stub.py"), "/usr/local/bin/psutil_stub.py", "0644"),
+                ]
+                files_payload = []
+                for src, target, mode in file_defs:
+                    if os.path.exists(src):
+                        with open(src, "rb") as f:
+                            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+                        files_payload.append({
+                            "name": os.path.basename(src),
+                            "path": os.path.relpath(src, BASE_DIR),
+                            "target": target,
+                            "mode": mode,
+                            "content_b64": content_b64,
+                        })
+                params["files"] = files_payload
+                params.setdefault("restart", True)
+                params.setdefault("strategy", "replace_py")
+                command["params"] = params
+        except Exception as e:
+            print(f"Warning: failed to embed files for update_client: {e}")
+
     # Save to DB
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
@@ -225,7 +265,8 @@ async def create_command(cmd: CreateCommandRequest):
         ''', (command_id, client_id, cmd.command_type, json.dumps(command), datetime.now(), 'queued'))
         await db.commit()
 
-    # Try to send to WebSocket client first
+
+    # Try to send to WebSocket client first (for non-update commands)
     sent_via_websocket = await send_command_to_websocket_client(client_id, command)
 
     if not sent_via_websocket:
