@@ -50,6 +50,14 @@ class AICommandCenter:
         self.conversation_history = []
         # Remember last requested logs window per client for better defaults
         self.last_logs_request_days: Dict[str, int] = {}
+        # Load API tokens from environment if available
+        self.ipinfo_token = os.getenv('IPINFO_TOKEN')
+        self.abuseipdb_key = os.getenv('ABUSEIPDB_KEY')
+        # Load API lookup limits from environment (default: 10)
+        self.ipinfo_max_lookups = int(os.getenv('IPINFO_MAX_LOOKUPS', '10'))
+        self.abuseipdb_max_lookups = int(os.getenv('ABUSEIPDB_MAX_LOOKUPS', '10'))
+        # Load GeoIP2 offline database path (free MaxMind GeoLite2)
+        self.geoip2_db_path = os.getenv('GEOIP2_DB_PATH')
 
         # Define function tools for OpenAI
         self.function_tools = [
@@ -260,6 +268,20 @@ class AICommandCenter:
                             "required": ["client_id"]
                         }
                     }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_wan_performance",
+                        "description": "Analyze WAN performance and connectivity from pfSense perspective. Monitors gateway latency, packet loss, interface errors, and bandwidth usage without requiring SD-WAN router access.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "client_id": {"type": "string", "description": "Client ID or name to analyze WAN performance for"}
+                            },
+                            "required": ["client_id"]
+                        }
+                    }
                 }
         ]
     def _truncate_string(self, s: str, max_len: int = 4000) -> str:
@@ -303,23 +325,63 @@ class AICommandCenter:
                     if 'total_entries' in res:
                         res['total_entries'] = total_entries
 
-                # Preserve query_logs results - these are already processed summaries
+                # Preserve query_logs results and WAN performance analysis - these are already processed summaries
                 is_query_result = any(key in res for key in ['summary', 'blocked_count', 'allowed_count', 'service', 'top_ips', 'top_ports'])
+                is_wan_analysis = any(key in res for key in ['analysis', 'wan_interfaces', 'gateway_quality', 'performance_analysis', 'quality_metrics', 'current_status', 'bandwidth_analysis', 'recommendations'])
+                is_security_assessment = isinstance(res.get('assessment'), dict)
 
-                if not is_query_result:
-                    # Remove large arrays only for non-query results
+                # If it's a security assessment, attach a compact summary to guide the LLM
+                if is_security_assessment:
+                    a = res['assessment']
+                    la = a.get('log_analysis', {}) if isinstance(a.get('log_analysis'), dict) else {}
+                    sh = a.get('system_health', {}) if isinstance(a.get('system_health'), dict) else {}
+                    blocked = la.get('blocked_events', {}).get('count', la.get('blocked_count', 0))
+                    allowed = la.get('allowed_events', {}).get('count', la.get('allowed_count', 0))
+                    total = (blocked or 0) + (allowed or 0)
+                    pct = lambda n: round((n / total) * 100, 1) if total else 0.0
+                    top_ip = None
+                    tip = la.get('top_blocked_ips')
+                    if isinstance(tip, list) and tip:
+                        try:
+                            # tip may be list of [ip, count] pairs
+                            ip0, cnt0 = tip[0][0], tip[0][1]
+                            top_ip = {"ip": ip0, "count": cnt0}
+                        except Exception:
+                            pass
+                    res['assessment_summary'] = {
+                        'risk_level': a.get('risk_level', 'Unknown'),
+                        'analysis_period_days': a.get('analysis_period_days'),
+                        'totals': {
+                            'total_connections': total,
+                            'blocked': {'count': blocked, 'percent': pct(blocked)},
+                            'allowed': {'count': allowed, 'percent': pct(allowed)}
+                        },
+                        'top_blocked_ip': top_ip,
+                        'brute_force_attempts': la.get('potential_brute_force', {}).get('count', 0),
+                        'port_scans': la.get('potential_port_scans', {}).get('count', 0),
+                        'system_health': {
+                            'uptime': sh.get('uptime_human') or sh.get('uptime'),
+                            'memory_usage_percent': sh.get('memory_usage_percent'),
+                            'disk_usage_percent': sh.get('disk_usage_percent'),
+                            'cpu_percent': (sh.get('cpu', {}) or {}).get('percent') if isinstance(sh.get('cpu'), dict) else sh.get('cpu_percent'),
+                            'network_interfaces': sh.get('network_interfaces')
+                        }
+                    }
+
+                if not (is_query_result or is_wan_analysis or is_security_assessment):
+                    # Remove large arrays only for non-query/non-WAN/non-assessment results
                     for key in list(res.keys()):
                         if isinstance(res[key], list) and len(res[key]) > 20:
                             res[key] = f"[{len(res[key])} items - truncated for context]"
 
-                # More lenient size limit for query results (risk assessments)
-                size_limit = 8000 if is_query_result else 3000
+                # More lenient size limit for query results, WAN analysis, and assessments
+                size_limit = 8000 if (is_query_result or is_wan_analysis or is_security_assessment) else 3000
                 payload = json.dumps(res)
                 if len(payload) > size_limit:
-                    if is_query_result:
-                        # For query results, just truncate examples but keep summaries
+                    if (is_query_result or is_wan_analysis or is_security_assessment):
+                        # For rich analyses, just truncate long example arrays but keep summaries
                         if 'examples' in res and isinstance(res['examples'], list):
-                            res['examples'] = res['examples'][:5]  # Keep first 5 examples
+                            res['examples'] = res['examples'][:5]
                         return res
                     else:
                         # Keep only essential keys for non-query results
@@ -334,6 +396,8 @@ class AICommandCenter:
                             summary['total_log_entries'] = res['total_entries']
                         if 'updated_files' in res:
                             summary['files_updated'] = len(res['updated_files']) if isinstance(res['updated_files'], list) else 'yes'
+                        if 'analysis' in res:
+                            summary['wan_analysis'] = 'WAN performance analysis completed'
                         return summary
                 return res
             return result
@@ -352,8 +416,8 @@ class AICommandCenter:
         if role == 'user':
             # Extract action verbs and key nouns from user input
             import re
-            # Common firewall management actions
-            actions = re.findall(r'\b(update|restart|get|check|analyze|risk|assessment|status|logs|rules|block|allow|monitor)\b', str(content).lower())
+            # Common firewall management actions (extended with WAN/perf terms)
+            actions = re.findall(r'\b(update|restart|get|check|analyze|risk|assessment|status|logs|rules|block|allow|monitor|wan|performance|latency|bandwidth|quality)\b', str(content).lower())
             # Client names and identifiers
             clients = re.findall(r'\b(opus-\d+|[\w-]+office|[\w-]+client|all)\b', str(content).lower())
             # Time/quantity indicators
@@ -403,22 +467,48 @@ class AICommandCenter:
         return f"{role}: {str(content)[:30]}"
 
     def _get_safe_conversation_history(self) -> List[Dict[str, Any]]:
-        """Get conversation history with keyword compression to prevent context overflow."""
-        # Get recent messages and compress them
-        recent_messages = self.conversation_history[-10:]  # Can afford more with compression
+        """Get conversation history with keyword compression while preserving tool-call structure.
+        Ensures that if there is a trailing sequence of [assistant(tool_calls), tool, tool, ...],
+        that entire chunk is kept verbatim so OpenAI can correlate tool outputs.
+        """
+        # Take a slightly larger window to be safe
+        recent = self.conversation_history[-12:]
 
-        compressed_history = []
-        for msg in recent_messages:
-            # Keep the last 2 messages in full detail for immediate context
-            if len(compressed_history) >= len(recent_messages) - 2:
-                compressed_history.append(msg)
-            else:
-                # Compress older messages to keywords
-                compressed_content = self._compress_message_to_keywords(msg)
-                compressed_history.append({
-                    "role": msg.get('role', 'user'),
-                    "content": compressed_content
-                })
+        # Find the last assistant message with tool_calls and keep it + all following messages
+        tail_start = None
+        for i in range(len(recent) - 1, -1, -1):
+            m = recent[i]
+            if m.get('role') == 'assistant' and m.get('tool_calls'):
+                tail_start = i
+                break
+            # If we encounter a non-tool message before finding assistant tool_calls, stop search
+            if m.get('role') != 'tool':
+                break
+
+        if tail_start is not None:
+            head = recent[:tail_start]
+            tail = recent[tail_start:]
+        else:
+            # Fallback: just keep the last 2 messages as-is
+            head = recent[:-2] if len(recent) > 2 else []
+            tail = recent[-2:] if len(recent) >= 2 else recent
+
+        compressed_history: List[Dict[str, Any]] = []
+
+        # Compress the head: skip tool and assistant-with-tool_calls, keyword-compress others
+        for msg in head:
+            if msg.get('role') == 'tool':
+                continue
+            if msg.get('role') == 'assistant' and msg.get('tool_calls'):
+                continue
+            compressed_content = self._compress_message_to_keywords(msg)
+            compressed_history.append({
+                "role": msg.get('role', 'user'),
+                "content": compressed_content
+            })
+
+        # Append the tail verbatim to preserve tool-call context
+        compressed_history.extend(tail)
 
         return compressed_history
 
@@ -1078,6 +1168,8 @@ class AICommandCenter:
                     arguments['client_id'],
                     arguments.get('force_restart', False)
                 )
+            elif function_name == "get_wan_performance":
+                return await self.get_wan_performance(arguments['client_id'])
 
             else:
                 return {"success": False, "error": f"Unknown function: {function_name}"}
@@ -1160,6 +1252,54 @@ class AICommandCenter:
                 frag = m.group(1) if m else ''
                 hits = lqe.filter_by_ip_fragment(frag) if frag else []
                 results = {'ip_fragment': frag, 'count': len(hits), 'examples': compact(hits)}
+            elif any(k in q for k in ['scan', 'scanning', 'reconnaissance', 'recon', 'sweep', 'probe']):
+                # Dedicated scanning detection query
+                scan_results = lqe.detect_scanning_activity(
+                    port_scan_threshold=15,
+                    network_sweep_threshold=15
+                )
+                results = {
+                    'scanning_activity': scan_results,
+                    'analysis_type': 'port_scan_and_network_sweep_detection'
+                }
+            elif any(k in q for k in ['geo', 'geographic', 'geography', 'country', 'countries', 'location', 'origin']):
+                # Geographic threat mapping query
+                geo_results = lqe.map_geographic_threats(
+                    ipinfo_token=self.ipinfo_token,
+                    top_n=effective_top_n,
+                    cache_db_path=self.db_path,
+                    blocked_only=True,
+                    max_api_lookups=self.ipinfo_max_lookups,
+                    geoip2_db_path=self.geoip2_db_path
+                )
+                results = {
+                    'geographic_analysis': geo_results,
+                    'analysis_type': 'geographic_threat_mapping'
+                }
+            elif any(k in q for k in ['threat intel', 'threat intelligence', 'malicious', 'known threat', 'abuseipdb', 'reputation']):
+                # Threat intelligence correlation query
+                threat_intel_results = lqe.correlate_with_threat_intel(
+                    abuseipdb_key=self.abuseipdb_key,
+                    cache_db_path=self.db_path,
+                    blocked_only=True,
+                    confidence_threshold=50,
+                    max_api_lookups=self.abuseipdb_max_lookups
+                )
+                results = {
+                    'threat_intelligence': threat_intel_results,
+                    'analysis_type': 'threat_intelligence_correlation'
+                }
+            elif any(k in q for k in ['outbound', 'c2', 'command and control', 'exfiltration', 'calling home', 'compromise', 'malware']):
+                # Outbound connection anomaly monitoring
+                outbound_results = lqe.monitor_outbound_connections(
+                    internal_subnets=None,  # Use RFC1918 defaults
+                    common_ports=None,      # Use standard ports
+                    min_connections=1
+                )
+                results = {
+                    'outbound_analysis': outbound_results,
+                    'analysis_type': 'outbound_connection_monitoring'
+                }
             elif any(k in q for k in ['risk', 'assessment', 'threat', 'security check', 'anomaly']):
                 # Risk assessment: aggregate multiple analyses for comprehensive view
                 summary = lqe.summarize(top_n=effective_top_n)
@@ -1171,45 +1311,143 @@ class AICommandCenter:
 
                 # Use enhanced LQE methods for better detection
                 potential_brute = lqe.detect_brute_force(threshold=5)
-                port_scans = lqe.detect_port_scans(threshold=10)
+                scanning_activity = lqe.detect_scanning_activity(
+                    port_scan_threshold=15,
+                    network_sweep_threshold=15
+                )
                 top_blocked_ips = lqe.get_top_blocked_ips(top_n=effective_top_n)
 
-                # Simple risk scoring heuristic
+                # Geographic threat analysis (optional, can use free GeoIP2 or paid ipinfo)
+                geographic_analysis = None
+                if self.ipinfo_token or self.geoip2_db_path:
+                    try:
+                        geographic_analysis = lqe.map_geographic_threats(
+                            ipinfo_token=self.ipinfo_token,
+                            top_n=effective_top_n,
+                            cache_db_path=self.db_path,
+                            blocked_only=True,
+                            max_api_lookups=self.ipinfo_max_lookups,
+                            geoip2_db_path=self.geoip2_db_path
+                        )
+                    except Exception as e:
+                        logger.warning(f"Geographic analysis failed: {e}")
+
+                # Threat intelligence correlation (optional, requires abuseipdb key)
+                threat_intel_analysis = None
+                if self.abuseipdb_key:
+                    try:
+                        threat_intel_analysis = lqe.correlate_with_threat_intel(
+                            abuseipdb_key=self.abuseipdb_key,
+                            cache_db_path=self.db_path,
+                            blocked_only=True,
+                            confidence_threshold=50,
+                            max_api_lookups=self.abuseipdb_max_lookups
+                        )
+                    except Exception as e:
+                        logger.warning(f"Threat intelligence correlation failed: {e}")
+
+                # Outbound connection monitoring (always run - critical for compromise detection)
+                outbound_analysis = None
+                try:
+                    outbound_analysis = lqe.monitor_outbound_connections(
+                        internal_subnets=None,  # Use RFC1918 defaults
+                        common_ports=None,      # Use standard ports
+                        min_connections=1
+                    )
+                except Exception as e:
+                    logger.warning(f"Outbound connection monitoring failed: {e}")
+
+                # Enhanced risk scoring heuristic
                 blocked_count = len(blocked)
                 brute_force_count = len(potential_brute)
-                port_scan_count = len(port_scans)
+                vertical_scan_count = scanning_activity.get('total_vertical_scans', 0)
+                horizontal_scan_count = scanning_activity.get('total_horizontal_scans', 0)
+                total_scan_count = vertical_scan_count + horizontal_scan_count
+                malicious_ips_count = threat_intel_analysis.get('malicious_ips_detected', 0) if threat_intel_analysis and threat_intel_analysis.get('success') else 0
+                suspicious_outbound_count = outbound_analysis.get('unique_internal_hosts_affected', 0) if outbound_analysis and outbound_analysis.get('success') else 0
 
-                if blocked_count > 100 or brute_force_count > 10 or port_scan_count > 20:
+                # Risk level calculation (enhanced with threat intel and outbound monitoring)
+                if suspicious_outbound_count > 0 or malicious_ips_count > 0 or blocked_count > 100 or brute_force_count > 10 or total_scan_count > 5:
                     risk_level = 'High'
-                elif blocked_count > 10 or brute_force_count > 0 or port_scan_count > 5:
+                elif blocked_count > 10 or brute_force_count > 0 or total_scan_count > 0:
                     risk_level = 'Medium'
                 else:
                     risk_level = 'Low'
 
                 # Generate recommendations
                 recommendations = []
+
+                # Outbound anomaly recommendations (CRITICAL - indicates potential compromise)
+                if outbound_analysis and outbound_analysis.get('success'):
+                    if suspicious_outbound_count > 0:
+                        recommendations.append(f'🚨 CRITICAL: {suspicious_outbound_count} internal host(s) making suspicious outbound connections - POSSIBLE COMPROMISE')
+                        suspicious_conns = outbound_analysis.get('suspicious_connections', [])
+                        if suspicious_conns:
+                            top_outbound = suspicious_conns[0]
+                            recommendations.append(
+                                f"Top suspicious outbound: {top_outbound['source_ip']} → {top_outbound['destination_ip']}:{top_outbound['destination_port']} "
+                                f"({top_outbound['protocol']}) - {top_outbound['connection_count']} connections - INVESTIGATE IMMEDIATELY"
+                            )
+
+                # Threat intelligence-based recommendations (highest priority)
+                if threat_intel_analysis and threat_intel_analysis.get('success'):
+                    if malicious_ips_count > 0:
+                        recommendations.append(f'⚠️ CRITICAL: {malicious_ips_count} known malicious IP(s) detected - IMMEDIATE BLOCKING RECOMMENDED')
+                        threat_findings = threat_intel_analysis.get('threat_findings', [])
+                        if threat_findings:
+                            top_threat = threat_findings[0]
+                            recommendations.append(
+                                f"Top threat: {top_threat['ip']} (Confidence: {top_threat['abuse_confidence_score']}%, "
+                                f"{top_threat['total_reports']} reports) - {top_threat['blocked_connections']} blocked connections"
+                            )
+
                 if brute_force_count > 0:
                     recommendations.append('Block top suspicious IPs if recurring')
                     recommendations.append('Review rules for authentication ports (SSH, RDP)')
-                if port_scan_count > 0:
-                    recommendations.append('Investigate potential port scanning activity')
+                if vertical_scan_count > 0:
+                    recommendations.append(f'Detected {vertical_scan_count} vertical port scan(s) - consider blocking scanning IPs')
+                if horizontal_scan_count > 0:
+                    recommendations.append(f'Detected {horizontal_scan_count} network sweep(s) - investigate reconnaissance activity')
                 if blocked_count > 50:
                     recommendations.append('Consider rate limiting or additional blocking rules')
                 if top_blocked_ips and top_blocked_ips[0][1] > 20:
                     recommendations.append(f'Investigate top blocked IP: {top_blocked_ips[0][0]} ({top_blocked_ips[0][1]} blocks)')
+
+                # Geographic-based recommendations
+                if geographic_analysis and geographic_analysis.get('success'):
+                    top_countries = geographic_analysis.get('top_source_countries', [])
+                    if top_countries:
+                        top_country = top_countries[0]
+                        if top_country['blocked_connections'] > 50:
+                            recommendations.append(
+                                f"High volume from {top_country['country_name']} ({top_country['country_code']}): "
+                                f"{top_country['blocked_connections']} blocked connections - consider country-level blocking"
+                            )
 
                 results = {
                     'risk_summary': summary,
                     'blocked_events': {'count': len(blocked), 'examples': compact(blocked)},
                     'allowed_events': {'count': len(allowed), 'examples': compact(allowed)},
                     'potential_brute_force': {'count': brute_force_count, 'examples': compact(potential_brute)},
-                    'potential_port_scans': {'count': port_scan_count, 'examples': compact(port_scans)},
+                    'scanning_activity': scanning_activity,
                     'web_traffic': {'http_count': len(http_hits), 'https_count': len(https_hits)},
                     'top_blocked_ips': top_blocked_ips,
                     'risk_level': risk_level,
                     'recommendations': recommendations,
                     'analysis_period_days': effective_days
                 }
+
+                # Add geographic analysis if available
+                if geographic_analysis:
+                    results['geographic_analysis'] = geographic_analysis
+
+                # Add threat intelligence if available
+                if threat_intel_analysis:
+                    results['threat_intelligence'] = threat_intel_analysis
+
+                # Add outbound analysis if available
+                if outbound_analysis:
+                    results['outbound_analysis'] = outbound_analysis
             else:
                 results = {'summary': lqe.summarize(top_n=effective_top_n)}
 
@@ -1370,6 +1608,160 @@ class AICommandCenter:
             # If API call fails, assume client_id is the actual ID
             return client_id
 
+    async def _maybe_handle_direct_intent(self, user_message: str) -> Optional[str]:
+        """Fast-path certain natural-language intents without calling the LLM.
+        Currently supports WAN performance requests like 'wan performance for opus-1'.
+        Returns a ready-to-print assistant reply string, or None to continue normal flow.
+        """
+        try:
+            text = (user_message or "").lower()
+            if "wan" in text and any(t in text for t in ["performance", "latency", "packet", "loss", "bandwidth", "quality"]):
+                # Try to detect target client by name from /clients
+                target_client_name = None
+                try:
+                    res = requests.get(f"{self.hq_url}/clients", timeout=15)
+                    res.raise_for_status()
+                    clients = res.json().get("clients", {})
+                    names = {v.get("client_name", ""): k for k, v in clients.items()}
+                    # Choose the first name that appears in the text
+                    for name in names.keys():
+                        if name and name.lower() in text:
+                            target_client_name = name
+                            break
+                    # If no explicit name found and exactly one connected client, default to it
+                    if not target_client_name and len(names) == 1:
+                        target_client_name = next(iter(names.keys()))
+                except Exception:
+                    pass
+
+                if not target_client_name:
+                    return ("Please specify a target client, e.g., 'wan performance for opus-1'. "
+                            "I couldn't determine which client to use.")
+
+                # Execute WAN performance analysis directly
+                result = await self.get_wan_performance(target_client_name)
+                if not result.get("success"):
+                    return f"Failed to get WAN performance for {target_client_name}: {result.get('error','unknown error')}"
+
+                # Build a comprehensive human-readable summary
+                parts = [f"🌐 WAN Performance Analysis for {target_client_name}"]
+                parts.append("=" * 50)
+
+                # Overall Quality Metrics
+                qm = result.get("quality_metrics") or {}
+                if isinstance(qm, dict):
+                    parts.append("📊 Overall Quality Metrics:")
+                    lat = qm.get("average_latency")
+                    loss = qm.get("average_packet_loss")
+                    score = qm.get("overall_quality_score")
+                    interface_count = qm.get("interface_count", 0)
+
+                    if lat is not None:
+                        parts.append(f"   • Average Latency: {lat} ms")
+                    if loss is not None:
+                        parts.append(f"   • Average Packet Loss: {loss}%")
+                    if score is not None:
+                        parts.append(f"   • Quality Score: {score}/100")
+                    parts.append(f"   • Active Interfaces: {interface_count}")
+                    parts.append("")
+
+                # Performance Analysis
+                pa = result.get("performance_analysis") or {}
+                if isinstance(pa, dict):
+                    status = pa.get("overall_status")
+                    if status:
+                        status_emoji = "✅" if status == "healthy" else "⚠️" if status == "degraded" else "❌"
+                        parts.append(f"🔍 Overall Status: {status_emoji} {status.upper()}")
+                        parts.append("")
+
+                    # Interface Details
+                    interface_analysis = pa.get("interface_analysis", {})
+                    if interface_analysis:
+                        parts.append("🔌 Interface Analysis:")
+                        for interface, details in interface_analysis.items():
+                            if isinstance(details, dict):
+                                iface_status = details.get("status", "unknown")
+                                iface_emoji = "✅" if iface_status == "healthy" else "⚠️" if iface_status == "degraded" else "❌"
+                                parts.append(f"   {iface_emoji} {interface}:")
+
+                                if "latency_ms" in details:
+                                    parts.append(f"      - Latency: {details['latency_ms']} ms")
+                                if "packet_loss_percent" in details:
+                                    parts.append(f"      - Packet Loss: {details['packet_loss_percent']}%")
+                                if "quality_score" in details:
+                                    parts.append(f"      - Quality Score: {details['quality_score']}/100")
+
+                                issues = details.get("issues", [])
+                                if issues:
+                                    parts.append(f"      - Issues: {'; '.join(issues)}")
+                        parts.append("")
+
+                # Bandwidth Analysis
+                ba = result.get("bandwidth_analysis") or {}
+                if isinstance(ba, dict):
+                    parts.append("📈 Bandwidth Usage:")
+                    total_sent = ba.get("total_bytes_sent", 0)
+                    total_recv = ba.get("total_bytes_received", 0)
+
+                    def format_bytes(bytes_val):
+                        if bytes_val >= 1024**4:
+                            return f"{bytes_val / (1024**4):.2f} TB"
+                        elif bytes_val >= 1024**3:
+                            return f"{bytes_val / (1024**3):.2f} GB"
+                        elif bytes_val >= 1024**2:
+                            return f"{bytes_val / (1024**2):.2f} MB"
+                        elif bytes_val >= 1024:
+                            return f"{bytes_val / 1024:.2f} KB"
+                        else:
+                            return f"{bytes_val} bytes"
+
+                    parts.append(f"   • Total Sent: {format_bytes(total_sent)}")
+                    parts.append(f"   • Total Received: {format_bytes(total_recv)}")
+
+                    interface_usage = ba.get("interface_usage", {})
+                    if interface_usage:
+                        parts.append("   • Per Interface:")
+                        for interface, usage in interface_usage.items():
+                            if isinstance(usage, dict):
+                                sent = usage.get("bytes_sent", 0)
+                                recv = usage.get("bytes_received", 0)
+                                if sent > 0 or recv > 0:  # Only show active interfaces
+                                    parts.append(f"      - {interface}: ↑{format_bytes(sent)} ↓{format_bytes(recv)}")
+                    parts.append("")
+
+                # Gateway Details
+                current_status = result.get("current_status", {})
+                if isinstance(current_status, dict):
+                    wan_interfaces = current_status.get("wan_interfaces", {})
+                    if wan_interfaces:
+                        parts.append("🌐 Gateway Monitoring:")
+                        for interface, details in wan_interfaces.items():
+                            if isinstance(details, dict):
+                                gw_monitoring = details.get("gateway_monitoring", {})
+                                if isinstance(gw_monitoring, dict) and gw_monitoring.get("status") == "success":
+                                    gw_ip = gw_monitoring.get("gateway_ip")
+                                    latency_samples = gw_monitoring.get("latency_samples", [])
+                                    parts.append(f"   • {interface} → {gw_ip}")
+                                    if latency_samples:
+                                        min_lat = min(latency_samples)
+                                        max_lat = max(latency_samples)
+                                        parts.append(f"      - Latency Range: {min_lat}-{max_lat} ms")
+                                        parts.append(f"      - Samples: {latency_samples}")
+                        parts.append("")
+
+                # Recommendations
+                recs = result.get("recommendations")
+                if isinstance(recs, list) and recs:
+                    parts.append("💡 Recommendations:")
+                    for rec in recs[:5]:  # Show up to 5 recommendations
+                        parts.append(f"   • {rec}")
+
+                return "\n".join(parts)
+        except Exception:
+            # On any error, fall back to normal LLM flow
+            return None
+        return None
+
     async def _send_command(self, client_id: str, command_type: str, params: Dict[str, Any]) -> Optional[str]:
         """Send a command to a client and return command ID"""
         try:
@@ -1448,6 +1840,59 @@ class AICommandCenter:
         except Exception as e:
             return {"success": False, "error": f"Failed to update client: {str(e)}"}
 
+    async def get_wan_performance(self, client_id: str) -> Dict[str, Any]:
+        """Get WAN performance analysis from pfSense client"""
+        try:
+            # Resolve client name to ID
+            resolved_client_id = await self._resolve_client_id(client_id)
+            if not resolved_client_id:
+                return {"success": False, "error": f"Client '{client_id}' not found"}
+
+            # Send WAN performance analysis command
+            res = requests.post(f"{self.hq_url}/command", json={
+                "client_id": resolved_client_id,
+                "command_type": "get_wan_performance",
+                "params": {}
+            }, timeout=30)
+            res.raise_for_status()
+            command_id = res.json().get("command_id")
+
+            if not command_id:
+                return {"success": False, "error": "Failed to enqueue WAN performance command"}
+
+            # Monitor command progress and get results
+            progress_info = await self._monitor_command_progress(command_id, client_id)
+
+            if progress_info.get("status") == "completed":
+                # NOTE: _monitor_command_progress returns the final payload under 'final_progress'
+                result = progress_info.get("final_progress", {})
+                # Flatten the analysis data to top level for better AI processing
+                if isinstance(result, dict) and "analysis" in result:
+                    flattened_result = {
+                        "success": True,
+                        "client_id": client_id,
+                        "message": f"WAN performance analysis completed for {client_id}",
+                        **result.get("analysis", {})  # Flatten analysis data to top level
+                    }
+                    return flattened_result
+                else:
+                    return {
+                        "success": True,
+                        "client_id": client_id,
+                        "analysis": result,
+                        "message": f"WAN performance analysis completed for {client_id}"
+                    }
+            else:
+                return {
+                    "success": False,
+                    "error": f"WAN performance analysis failed or timed out for {client_id}",
+                    "progress": progress_info
+                }
+
+        except Exception as e:
+            logger.error(f"Error getting WAN performance for {client_id}: {e}")
+            return {"success": False, "error": str(e)}
+
     async def chat_with_ai(self, user_message: str) -> str:
         """Chat with AI assistant for firewall management"""
         try:
@@ -1456,6 +1901,13 @@ class AICommandCenter:
                 "role": "user",
                 "content": user_message
             })
+
+            # Fast-path direct intents (e.g., 'wan performance for opus-1')
+            direct = await self._maybe_handle_direct_intent(user_message)
+            if direct:
+                # Record assistant reply in history and return
+                self.conversation_history.append({"role": "assistant", "content": direct})
+                return direct
 
             # System message for context
             system_message = {
@@ -1487,6 +1939,13 @@ Risk Assessment Capabilities:
   - Provide a structured assessment: Low/Medium/High risk level, key findings, recommendations (e.g., block IP, update rules).
   - Prioritize accuracy; if data is insufficient, request more logs or clarification.
 
+Formatting requirements for risk assessments (always include these sections with numbers when available):
+- System Health: uptime, memory usage %, disk usage %, CPU %, network interfaces
+- Firewall Logs Analysis: total connections, blocked count and %, allowed count and %
+- Threat Analysis: top blocked IP with count, brute-force attempts on auth ports (e.g., 22/3389), unusual protocols/ports, potential scans
+- Risk Level: Low/Medium/High with 1–3 bullets why
+- Recommendations: 3–5 concrete actions (block IP, adjust rules, increase logging, etc.)
+
 When users ask about firewall management, use the appropriate functions to help them. Always be clear about what actions you're taking and ask for confirmation before making changes that could affect firewall security or connectivity.
 
 Current capabilities:
@@ -1497,6 +1956,7 @@ Current capabilities:
 - Monitor system health and performance
 - Restart firewall services when needed
 - Update client software remotely (push new code, restart services)
+- Analyze WAN performance and connectivity from pfSense perspective (gateway latency, packet loss, interface errors, bandwidth usage)
 
 Client Addressing:
 - Clients can be addressed by their friendly names (e.g., "opus-1", "branch-office-2") or client IDs
@@ -1516,7 +1976,7 @@ Behavioral rules for user experience:
 
             # Make API call to OpenAI
             response = self.openai_client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4o",
                 messages=messages,
                 tools=self.function_tools,
                 tool_choice="auto",
@@ -1568,7 +2028,7 @@ Behavioral rules for user experience:
 
                 # Get final response from AI with function results
                 final_response = self.openai_client.chat.completions.create(
-                    model="gpt-4",
+                    model="gpt-4o",
                     messages=[system_message] + self._get_safe_conversation_history(),
                     temperature=0.7,
                     max_tokens=800
