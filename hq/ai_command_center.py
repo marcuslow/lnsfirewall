@@ -20,15 +20,21 @@ import re
 
 # Local RQE (Rules Query Engine)
 try:
-    from rqe import RulesQueryEngine
+    from hq.rqe import RulesQueryEngine
 except Exception:
-    RulesQueryEngine = None  # Will handle gracefully at call site
+    try:
+        from rqe import RulesQueryEngine
+    except Exception:
+        RulesQueryEngine = None  # Will handle gracefully at call site
 
 # Local LQE (Logs Query Engine)
 try:
-    from lqe import LogQueryEngine
+    from hq.lqe import LogQueryEngine
 except Exception:
-    LogQueryEngine = None
+    try:
+        from lqe import LogQueryEngine
+    except Exception:
+        LogQueryEngine = None
 
 # Configure logging (will be reconfigured in main() based on verbose flag)
 logging.basicConfig(
@@ -43,6 +49,9 @@ DEFAULT_DB_PATH = os.getenv('HQ_DB_PATH', os.path.join(BASE_DIR, 'hq_database.db
 
 class AICommandCenter:
     def __init__(self, hq_url: str, openai_api_key: str, db_path: str = DEFAULT_DB_PATH, verbose: bool = False):
+        # Load environment variables first
+        load_dotenv()
+
         self.hq_url = hq_url.rstrip('/')
         self.db_path = db_path or DEFAULT_DB_PATH
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
@@ -194,7 +203,7 @@ class AICommandCenter:
                     "type": "function",
                     "function": {
                         "name": "query_logs",
-                        "description": "Query and summarize locally stored firewall logs without sending raw logs to AI.",
+                        "description": "Analyze locally stored firewall logs and return structured security insights. Use for ALL log/security questions. Supported intents: 'scanning' (port scan detection), 'geographic' (country analysis), 'threat intelligence' (malicious IP check), 'outbound anomaly' (suspicious outbound traffic), 'top blocked IPs', 'summary' (includes top ports/IPs/services), direct filters like 'blocked', 'port 22', 'ssh', 'ip 1.2.3.4'. Never ask the user for port numbers.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -1177,15 +1186,60 @@ class AICommandCenter:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def query_logs(self, client_id: str, query: str, days: Optional[int] = None, top_n: Optional[int] = None) -> Dict[str, Any]:
-        """Query locally stored logs using LogQueryEngine. No raw logs are sent to AI."""
+    async def _ensure_fresh_logs(self, client_id: str, max_age_hours: int = 6) -> Dict[str, Any]:
+        """
+        Ensure logs are fresh (less than max_age_hours old).
+        If logs are stale, automatically request fresh logs from client.
+
+        Returns:
+            {"fresh": True/False, "age_hours": float, "refreshed": True/False}
+        """
+        try:
+            # Check when logs were last updated
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute('''
+                    SELECT MAX(timestamp) as last_log_time
+                    FROM logs
+                    WHERE client_id = ?
+                ''', (client_id,))
+                row = await cursor.fetchone()
+
+                if not row or not row[0]:
+                    # No logs found - need to fetch
+                    logger.info(f"No logs found for {client_id}, requesting fresh logs...")
+                    await self.request_client_logs(client_id, days=7)  # Default to 7 days
+                    return {"fresh": False, "age_hours": None, "refreshed": True}
+
+                last_log_time = datetime.fromisoformat(row[0])
+                age = datetime.now() - last_log_time
+                age_hours = age.total_seconds() / 3600
+
+                if age_hours > max_age_hours:
+                    logger.info(f"Logs for {client_id} are {age_hours:.1f} hours old (max: {max_age_hours}h), requesting fresh logs...")
+                    await self.request_client_logs(client_id, days=7)  # Default to 7 days
+                    return {"fresh": False, "age_hours": age_hours, "refreshed": True}
+
+                logger.info(f"Logs for {client_id} are fresh ({age_hours:.1f} hours old)")
+                return {"fresh": True, "age_hours": age_hours, "refreshed": False}
+
+        except Exception as e:
+            logger.error(f"Error checking log freshness for {client_id}: {e}")
+            return {"fresh": False, "age_hours": None, "refreshed": False, "error": str(e)}
+
+    async def query_logs(self, client_id: str, query: str, days: Optional[int] = None, top_n: Optional[int] = None, auto_refresh: bool = True) -> Dict[str, Any]:
+        """
+        Query locally stored logs using LogQueryEngine. No raw logs are sent to AI.
+
+        Args:
+            client_id: Client ID or name
+            query: Natural language query
+            days: Number of days to analyze
+            top_n: Number of top results to return
+            auto_refresh: If True, automatically refresh logs if older than 6 hours
+        """
         try:
             if LogQueryEngine is None:
                 return {"success": False, "error": "LogQueryEngine module not available"}
-
-            # Default window selection: use last requested for this client, else 7
-            effective_days = days if isinstance(days, int) and days > 0 else self.last_logs_request_days.get(client_id, 7)
-            effective_top_n = top_n if isinstance(top_n, int) and top_n > 0 else 10
 
             # Map provided name -> actual ID as needed
             actual_client_id = client_id
@@ -1198,6 +1252,17 @@ class AICommandCenter:
                     actual_client_id = name_to_id[client_id]
             except Exception:
                 pass
+
+            # Auto-refresh logs if stale (older than 6 hours)
+            if auto_refresh:
+                freshness = await self._ensure_fresh_logs(actual_client_id, max_age_hours=6)
+                if freshness.get('refreshed'):
+                    # Wait a moment for logs to be ingested
+                    await asyncio.sleep(2)
+
+            # Default window selection: use last requested for this client, else 7
+            effective_days = days if isinstance(days, int) and days > 0 else self.last_logs_request_days.get(client_id, 7)
+            effective_top_n = top_n if isinstance(top_n, int) and top_n > 0 else 10
 
             lqe = LogQueryEngine.from_db(self.db_path, actual_client_id, since_days=effective_days)
 
@@ -1462,42 +1527,43 @@ class AICommandCenter:
             return {'success': False, 'error': str(e)}
 
     async def perform_risk_assessment(self, client_id: str, days: int = 7, force_refresh: bool = False) -> Dict[str, Any]:
-        """Perform comprehensive security risk assessment on a client"""
+        """
+        Perform comprehensive security risk assessment on a client.
+        Automatically ensures logs are fresh (< 6 hours old) before analysis.
+        """
         try:
             # Step 1: Get system health
             health = await self.get_client_status(client_id)
             if not health.get('success'):
                 return health  # Propagate error
 
-            # Step 2: Check for recent logs (e.g., last ingestion within 1 day)
-            async with aiosqlite.connect(self.db_path) as db:
-                # Map provided name -> actual ID as needed
-                actual_client_id = client_id
-                try:
-                    res = requests.get(f"{self.hq_url}/clients", timeout=30)
-                    res.raise_for_status()
-                    clients = res.json().get('clients', {})
-                    name_to_id = {v.get('client_name', ''): k for k, v in clients.items()}
-                    if client_id in name_to_id:
-                        actual_client_id = name_to_id[client_id]
-                except Exception:
-                    pass
+            # Step 2: Map provided name -> actual ID as needed
+            actual_client_id = client_id
+            try:
+                res = requests.get(f"{self.hq_url}/clients", timeout=30)
+                res.raise_for_status()
+                clients = res.json().get('clients', {})
+                name_to_id = {v.get('client_name', ''): k for k, v in clients.items()}
+                if client_id in name_to_id:
+                    actual_client_id = name_to_id[client_id]
+            except Exception:
+                pass
 
-                cursor = await db.execute("SELECT MAX(timestamp) FROM logs WHERE client_id = ?", (actual_client_id,))
-                row = await cursor.fetchone()
-                last_log_ts = row[0] if row and row[0] else None
-                last_log_dt = datetime.fromisoformat(last_log_ts) if last_log_ts else None
-
-            # Step 3: Request fresh logs if needed
-            if force_refresh or not last_log_dt or (datetime.now() - last_log_dt) > timedelta(days=1):
+            # Step 3: Ensure fresh logs (< 6 hours old) before running analysis
+            freshness = await self._ensure_fresh_logs(actual_client_id, max_age_hours=6)
+            if force_refresh and not freshness.get('refreshed'):
+                # Force refresh even if logs are fresh
                 log_req = await self.request_client_logs(client_id, days)
                 if not log_req.get('success'):
                     return log_req
-                # Note: In production, you might want to wait for completion here
-                # For now, we'll proceed with existing logs and note if refresh was attempted
+                freshness['refreshed'] = True
 
-            # Step 4: Query logs for risk indicators
-            risk_query = await self.query_logs(client_id, 'risk assessment', days=days, top_n=10)
+            # Wait for logs to be ingested if we just refreshed
+            if freshness.get('refreshed'):
+                await asyncio.sleep(2)
+
+            # Step 4: Query logs for risk indicators (auto_refresh=False since we already checked)
+            risk_query = await self.query_logs(client_id, 'summary', days=days, top_n=10, auto_refresh=False)
             if not risk_query.get('success'):
                 return risk_query
 
@@ -1529,6 +1595,14 @@ class AICommandCenter:
                     key_findings.append(f"High memory usage: {memory_usage}%")
                 if disk_usage > 80:
                     key_findings.append(f"High disk usage: {disk_usage}%")
+
+            # Get log freshness info
+            last_log_ts = "Unknown"
+            last_log_dt = None
+            if freshness.get('age_hours') is not None:
+                age_hours = freshness['age_hours']
+                last_log_dt = datetime.now() - timedelta(hours=age_hours)
+                last_log_ts = last_log_dt.isoformat()
 
             assessment = {
                 'client_id': actual_client_id,
@@ -1757,6 +1831,104 @@ class AICommandCenter:
                         parts.append(f"   • {rec}")
 
                 return "\n".join(parts)
+
+            # Direct handling: Security assessment/summary with explicit timeframe
+            import re as _re
+
+            def _parse_days(text_in: str) -> int:
+                t = (text_in or "").lower()
+                # Explicit hour-based
+                if "24 hour" in t or "24hour" in t or "last day" in t or "today" in t:
+                    return 1
+                # Common phrases
+                if any(p in t for p in ["past week", "last week", "this week"]):
+                    return 7
+                if any(p in t for p in ["past month", "last month"]):
+                    return 30
+                # Generic 'last/past X days' or standalone 'X days'
+                m = _re.search(r"(?:last|past|over the last)\s*(\d{1,3})\s*day", t)
+                if m:
+                    return max(1, min(90, int(m.group(1))))
+                m2 = _re.search(r"\b(\d{1,3})\s*days\b", t)
+                if m2:
+                    return max(1, min(90, int(m2.group(1))))
+                # Fallback to default 7 days
+                return 7
+
+            def _detect_target_client(text_in: str) -> Optional[str]:
+                # Try to detect target client by name from /clients
+                try:
+                    res = requests.get(f"{self.hq_url}/clients", timeout=15)
+                    res.raise_for_status()
+                    clients = res.json().get("clients", {})
+                    names = {v.get("client_name", ""): k for k, v in clients.items()}
+                    # Choose the first name that appears in the text
+                    for name in names.keys():
+                        if name and name.lower() in (text_in or "").lower():
+                            return name
+                    # If no explicit name found and exactly one connected client, default to it
+                    if len(names) == 1:
+                        return next(iter(names.keys()))
+                except Exception:
+                    pass
+                return None
+
+            # Assessment first: more specific intent
+            if any(k in text for k in ["risk assessment", "security assessment", "assessment"]):
+                target_client_name = _detect_target_client(user_message)
+                if not target_client_name:
+                    return ("Please specify a target client, e.g., 'security assessment for opus-1'. "
+                            "I couldn't determine which client to use.")
+                days = _parse_days(user_message)
+                assess = await self.perform_risk_assessment(target_client_name, days=days, force_refresh=False)
+                if not assess.get("success"):
+                    return f"Failed to perform risk assessment for {target_client_name}: {assess.get('error','unknown error')}"
+                a = assess.get("assessment", {}) or {}
+                rl = a.get("risk_level", "Unknown")
+                kf = a.get("key_findings", []) or []
+                lines = [f"Security risk assessment for {target_client_name} (last {days} day(s)):"]
+                lines.append(f"Risk level: {rl}")
+                if kf:
+                    lines.append("Key findings:")
+                    for item in kf[:6]:
+                        lines.append(f"- {item}")
+                return "\n".join(lines)
+
+            # Summary intent
+            if any(k in text for k in ["security summary", "log summary", "summary", "overview"]):
+                target_client_name = _detect_target_client(user_message)
+                if not target_client_name:
+                    return ("Please specify a target client, e.g., 'security summary for opus-1'. "
+                            "I couldn't determine which client to use.")
+                days = _parse_days(user_message)
+                qres = await self.query_logs(target_client_name, 'summary', days=days, top_n=10, auto_refresh=True)
+                if not qres.get("success"):
+                    return f"Failed to get security summary for {target_client_name}: {qres.get('error','unknown error')}"
+                summ = (qres.get("results", {}) or {}).get("summary", {}) or {}
+                total = summ.get("total_entries", 0)
+                blocked = summ.get("blocked_count", 0)
+                allowed = summ.get("allowed_count", 0)
+                top_dst_ports = summ.get("top_dst_ports", []) or []
+                top_src_ips = summ.get("top_src_ips", []) or []
+
+                lines = [f"Security summary for {target_client_name} (last {days} day(s)):"]
+                lines.append(f"Total log entries: {total}")
+                lines.append(f"Blocked: {blocked}")
+                lines.append(f"Allowed: {allowed}")
+                if top_dst_ports:
+                    lines.append("Top destination ports:")
+                    for item in top_dst_ports[:5]:
+                        port = item.get("value")
+                        cnt = item.get("count")
+                        lines.append(f"- {port}: {cnt}")
+                if top_src_ips:
+                    lines.append("Top source IPs:")
+                    for item in top_src_ips[:5]:
+                        ip = item.get("value")
+                        cnt = item.get("count")
+                        lines.append(f"- {ip}: {cnt}")
+                return "\n".join(lines)
+
         except Exception:
             # On any error, fall back to normal LLM flow
             return None
@@ -1924,11 +2096,44 @@ class AICommandCenter:
 5. Retrieve previously stored logs from the database
 6. Query stored logs for summaries, filtered events (e.g., blocked, by port/service/IP)
 
+TOOL-FIRST POLICY:
+- For ANY user question that requires data or analysis, you MUST call one of the provided tools on your first turn.
+- Do NOT respond with narrative like "initiating analysis" or "starting a scan" without actually calling a tool.
+- For log/security questions, ALWAYS call query_logs immediately with the correct parameters.
+- DEFAULT: If a log/security intent is unclear, call query_logs with query='summary'.
+
 Log Analysis Capabilities:
 - Parse pfSense filter logs with rule numbers, interfaces, actions, protocols, IPs
 - Parse pfBlockerNG logs with block lists, threat categories, source/destination details
 - Generate statistics: blocked vs allowed connections, top source/destination IPs, protocol distribution
 - Track security events and potential threats
+
+Specific Query Types (use these exact mappings):
+- PORT SCANNING ("port scanning activity", "detected scans", "reconnaissance") -> call query_logs with query='scanning'
+- GEOGRAPHIC ("which countries", "attack sources") -> call query_logs with query='geographic'
+- THREAT INTELLIGENCE ("malicious IPs", "known threats") -> call query_logs with query='threat intelligence'
+- OUTBOUND ANOMALIES ("suspicious outbound", "outbound traffic") -> call query_logs with query='outbound anomaly'
+- TOP BLOCKED IPs ("top blocked", "most attacks") -> call query_logs with query='top blocked IPs'
+- PORTS TARGETED MOST ("ports targeted the most", "most targeted ports", "top ports") -> call query_logs with query='summary' and report top_ports
+- SECURITY SUMMARY OVER TIME ("security summary", "last 24 hours/7 days/30 days") -> call query_logs with query='summary' and set days accordingly
+
+Time Window Parsing:
+- "last 24 hours" / "today" / "past day" => days=1
+- "last 7 days" / "past week" / "this week" => days=7
+- "last 30 days" / "past month" => days=30
+- If the timeframe is not specified, default to days=7
+
+Response formatting by query type (be concise, factual, include key numbers):
+- Port Scanning: report total_vertical_scans, total_horizontal_scans; list top scanner IPs with attempt counts.
+- Top Blocked IPs: provide a ranked list of IPs with block counts (e.g., IP · 1,234 blocks), plus total blocked.
+- Threat Intelligence: report malicious_ips_detected / total_ips_checked; list top 3–5 IPs with confidence/abuse scores and category/country if available.
+- Outbound Anomaly: report suspicious_connections; if zero, say none were detected.
+- Ports Targeted Most: list top ports with counts and service names (e.g., 22/SSH · 496 attempts).
+- Time-based Summary: explicitly state the timeframe (e.g., "last 24 hours") and provide blocked/allowed counts and top items.
+
+CRITICAL:
+- Never ask users to specify ports or provide more details for these queries — the tools automatically analyze all relevant data.
+- When asked about port scanning, scanning activity, or reconnaissance — IMMEDIATELY call query_logs with query='scanning'. Do NOT provide procedural responses.
 
 Risk Assessment Capabilities:
 - When asked for a risk assessment, threat analysis, or security check:
@@ -1980,7 +2185,7 @@ Behavioral rules for user experience:
                 messages=messages,
                 tools=self.function_tools,
                 tool_choice="auto",
-                temperature=0.7,
+                temperature=0.2,
 
                 max_tokens=1500
             )
@@ -2030,7 +2235,7 @@ Behavioral rules for user experience:
                 final_response = self.openai_client.chat.completions.create(
                     model="gpt-4o",
                     messages=[system_message] + self._get_safe_conversation_history(),
-                    temperature=0.7,
+                    temperature=0.2,
                     max_tokens=800
                 )
 
