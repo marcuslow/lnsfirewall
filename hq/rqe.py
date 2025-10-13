@@ -124,21 +124,22 @@ class RulesQueryEngine:
         If the client cannot be resolved, fall back to the latest ruleset across all clients.
         """
         async with aiosqlite.connect(db_path) as db:
-            # Resolve client id
-            actual_id = client_id_or_name
+            # Resolve client id - normalize to lowercase for consistent lookup
+            actual_id = client_id_or_name.lower()
             try:
                 cur = await db.execute("SELECT id, client_name FROM clients")
                 rows = await cur.fetchall()
                 m = {r[0]: r[1] for r in rows}
                 if client_id_or_name not in m:
-                    # search by name
+                    # search by name (case-insensitive)
                     for cid, name in m.items():
-                        if name == client_id_or_name:
-                            actual_id = cid
+                        if name and name.lower() == client_id_or_name.lower():
+                            actual_id = name.lower()  # Use normalized name
                             break
             except Exception:
                 pass
 
+            # Query for latest rules (actual_id is already normalized to lowercase)
             cur = await db.execute(
                 """
                 SELECT rules_xml, id

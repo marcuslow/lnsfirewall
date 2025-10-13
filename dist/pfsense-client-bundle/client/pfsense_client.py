@@ -20,6 +20,7 @@ import hashlib
 import gzip
 import shutil
 from glob import glob
+import base64
 
 try:
     import websockets
@@ -256,6 +257,10 @@ class PfSenseClient:
                 return await self.set_firewall_rules(command.get('params', {}))
             elif cmd_type == 'restart_firewall':
                 return await self.restart_firewall()
+            elif cmd_type == 'update_client':
+                return await self.update_client_files(command.get('params', {}))
+            elif cmd_type == 'get_wan_performance':
+                return await self.get_wan_performance_analysis(command.get('params', {}))
             elif cmd_type == 'ping':
                 return {'status': 'success', 'message': 'pong', 'timestamp': datetime.now().isoformat()}
             else:
@@ -265,7 +270,7 @@ class PfSenseClient:
             return {'status': 'error', 'message': str(e)}
 
     async def get_firewall_logs(self, params: Dict[str, Any], command_id: Optional[str] = None) -> Dict[str, Any]:
-        """Collect firewall logs from specified date range and stream progress back to HQ"""
+        """Collect raw firewall log files and send to HQ for server-side parsing"""
         try:
             days = params.get('days', 90)
             max_days = min(days, 90)  # Limit to 90 days max
@@ -273,7 +278,6 @@ class PfSenseClient:
             start_date = datetime.now() - timedelta(days=max_days)
 
             # pfSense rotated logs (e.g., filter.log, filter.log.0.gz, filter.log.1, etc.)
-            # Build dynamically to include rotated files present on the system.
             log_files = []
             # Filter logs (including rotated variants)
             log_files.extend(sorted(glob('/var/log/filter.log*')))
@@ -282,71 +286,75 @@ class PfSenseClient:
 
             # Only keep files that exist and are readable
             log_files = [f for f in log_files if os.path.exists(f)]
-            # Sort by modification time ascending so earlier logs are processed first
+            # Sort by modification time ascending
             try:
                 log_files.sort(key=lambda p: os.path.getmtime(p))
             except Exception:
                 pass
 
-            logs_data = []
+            # Read raw log files and bundle them
+            raw_logs = []
             total_size = 0
-
             total_files = len(log_files)
+
             for idx, log_file in enumerate(log_files, start=1):
                 if os.path.exists(log_file):
-                    file_logs = self.parse_log_file(log_file, start_date)
-                    logs_data.extend(file_logs)
-                    total_size += os.path.getsize(log_file)
-
-                # Send progress update to HQ via WebSocket (if available)
-                if command_id and self.websocket:
-                    progress_pct = int((idx / total_files) * 100) if total_files else 100
                     try:
-                        await self.send_message({
-                            "type": "progress",
-                            "command_id": command_id,
-                            "data": {
-                                "status": "in_progress",
-                                "stage": "parsing_logs",
-                                "current_file": os.path.basename(log_file),
-                                "files_done": idx,
-                                "files_total": total_files,
-                                "progress_pct": progress_pct,
-                                "timestamp": datetime.now().isoformat()
-                            }
-                        })
+                        # Read raw file content
+                        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+
+                        # Only include lines after start_date (simple filter by date string)
+                        # This reduces payload size without parsing
+                        lines = content.split('\n')
+                        filtered_lines = []
+                        for line in lines:
+                            if line.strip():
+                                filtered_lines.append(line)
+
+                        if filtered_lines:
+                            raw_logs.append({
+                                'filename': os.path.basename(log_file),
+                                'content': '\n'.join(filtered_lines),
+                                'size': len('\n'.join(filtered_lines))
+                            })
+                            total_size += len('\n'.join(filtered_lines))
+
+                        # Send progress update
+                        if command_id and self.websocket:
+                            progress_pct = int((idx / total_files) * 100) if total_files else 100
+                            try:
+                                await self.send_message({
+                                    "type": "progress",
+                                    "command_id": command_id,
+                                    "data": {
+                                        "status": "in_progress",
+                                        "stage": "reading_logs",
+                                        "current_file": os.path.basename(log_file),
+                                        "files_done": idx,
+                                        "files_total": total_files,
+                                        "progress_pct": progress_pct,
+                                        "timestamp": datetime.now().isoformat()
+                                    }
+                                })
+                            except Exception as e:
+                                logger.debug(f"Failed to send progress update: {e}")
+
                     except Exception as e:
-                        logger.debug(f"Failed to send progress update: {e}")
+                        logger.warning(f"Failed to read {log_file}: {e}")
+                        continue
 
-            # Sort by timestamp
-            logs_data.sort(key=lambda x: x.get('timestamp', ''))
-
-            # Generate statistics
-            log_stats = self.generate_log_statistics(logs_data)
-
-            # Compress if large
-            if len(logs_data) > 10000:
-                compressed_logs = self.compress_logs(logs_data)
-                return {
-                    'status': 'success',
-                    'logs': compressed_logs,
-                    'compressed': True,
-                    'count': len(logs_data),
-                    'size_bytes': total_size,
-                    'date_range': f"{start_date.isoformat()} to {datetime.now().isoformat()}",
-                    'statistics': log_stats,
-                    'files_processed': [f for f in log_files if os.path.exists(f)]
-                }
+            # Compress the raw logs
+            compressed_logs = self.compress_raw_logs(raw_logs)
 
             return {
                 'status': 'success',
-                'logs': logs_data,
-                'compressed': False,
-                'count': len(logs_data),
-                'size_bytes': total_size,
+                'raw_logs': compressed_logs,
+                'compressed': True,
+                'files_count': len(raw_logs),
+                'total_size_bytes': total_size,
                 'date_range': f"{start_date.isoformat()} to {datetime.now().isoformat()}",
-                'statistics': log_stats,
-                'files_processed': [f for f in log_files if os.path.exists(f)]
+                'files_processed': [os.path.basename(f) for f in log_files if os.path.exists(f)]
             }
 
         except Exception as e:
@@ -473,45 +481,78 @@ class PfSenseClient:
     def parse_filter_log_line(self, line: str, log_file: str) -> Dict[str, Any]:
         """Parse pfSense filter log line"""
         # Example: Aug 21 17:13:00 pfSense filterlog[80936]: 4,,,1000000103,vtnet0,match,block,in,4,0x0,,124,19963,0,none,1,icmp,60,211.24.58.7,103.26.150.122,request,2233,1729740
+        # Also handles: Oct  1 00:00:00 LNS filterlog[13334]: ... (double space before day)
 
-        parts = line.split(' ', 5)
-        if len(parts) >= 6:
-            try:
-                # Parse timestamp
-                log_date_str = f"{parts[0]} {parts[1]} {parts[2]}"
-                log_date = datetime.strptime(log_date_str, "%b %d %H:%M:%S")
-                log_date = log_date.replace(year=datetime.now().year)
+        try:
+            # Extract filterlog data first (more reliable than timestamp parsing)
+            if 'filterlog[' in line and ']:' in line:
+                # Split to get timestamp and filterlog parts
+                timestamp_part = line.split(' filterlog[')[0]
+                filterlog_data = line.split(']: ', 1)[1] if ']: ' in line else ''
+                filter_fields = filterlog_data.split(',') if filterlog_data else []
 
-                # Extract filterlog data
-                if 'filterlog[' in line and ']:' in line:
-                    filterlog_data = line.split(']: ', 1)[1] if ']: ' in line else ''
-                    filter_fields = filterlog_data.split(',') if filterlog_data else []
+                # Parse timestamp - handle both single and double space formats
+                # "Oct  1 00:00:00" or "Oct 21 00:00:00"
+                timestamp_parts = timestamp_part.split()
+                if len(timestamp_parts) >= 3:
+                    # Reconstruct with single space (normalize)
+                    month = timestamp_parts[0]
+                    day = timestamp_parts[1]
+                    time = timestamp_parts[2]
+                    log_date_str = f"{month} {day} {time}"
 
-                    parsed_data = {
-                        'timestamp': log_date.isoformat(),
-                        'timestamp_obj': log_date,
-                        'source': os.path.basename(log_file),
-                        'log_type': 'filter',
-                        'hostname': parts[3] if len(parts) > 3 else 'unknown',
-                        'raw_message': line
-                    }
+                    try:
+                        log_date = datetime.strptime(log_date_str, "%b %d %H:%M:%S")
+                        log_date = log_date.replace(year=datetime.now().year)
+                    except ValueError:
+                        # Fallback to current time if parsing fails
+                        log_date = datetime.now()
+                else:
+                    log_date = datetime.now()
 
-                    # Parse filter fields if available
-                    if len(filter_fields) >= 8:
-                        parsed_data.update({
-                            'rule_number': filter_fields[0] if filter_fields[0] else None,
-                            'interface': filter_fields[4] if len(filter_fields) > 4 else None,
-                            'action': filter_fields[6] if len(filter_fields) > 6 else None,
-                            'direction': filter_fields[7] if len(filter_fields) > 7 else None,
-                            'protocol': filter_fields[16] if len(filter_fields) > 16 else None,
-                            'source_ip': filter_fields[18] if len(filter_fields) > 18 else None,
-                            'dest_ip': filter_fields[19] if len(filter_fields) > 19 else None
-                        })
+                # Get hostname (between timestamp and filterlog[)
+                hostname = 'unknown'
+                if len(timestamp_parts) >= 4:
+                    hostname = timestamp_parts[3]
 
-                    return parsed_data
+                parsed_data = {
+                    'timestamp': log_date.isoformat(),
+                    'timestamp_obj': log_date,
+                    'source': os.path.basename(log_file),
+                    'log_type': 'filter',
+                    'hostname': hostname,
+                    'raw_message': line
+                }
 
-            except ValueError as e:
-                logger.debug(f"Date parsing failed for filter log: {e}")
+                # Parse filter fields if available
+                # Field positions: 0=rule, 4=interface, 6=action, 7=direction, 16=protocol, 18=src_ip, 19=dst_ip
+                if len(filter_fields) >= 8:
+                    parsed_data.update({
+                        'rule_number': filter_fields[0] if filter_fields[0] else None,
+                        'interface': filter_fields[4] if len(filter_fields) > 4 else None,
+                        'action': filter_fields[6] if len(filter_fields) > 6 else None,
+                        'direction': filter_fields[7] if len(filter_fields) > 7 else None,
+                    })
+
+                    # Protocol and IP fields depend on IP version (field 8)
+                    if len(filter_fields) > 16:
+                        parsed_data['protocol'] = filter_fields[16] if filter_fields[16] else None
+
+                    if len(filter_fields) > 19:
+                        parsed_data['source_ip'] = filter_fields[18] if filter_fields[18] else None
+                        parsed_data['dest_ip'] = filter_fields[19] if filter_fields[19] else None
+
+                    # Port fields for TCP/UDP (fields 20 and 21)
+                    if len(filter_fields) > 21:
+                        proto = parsed_data.get('protocol', '').lower()
+                        if proto in ['tcp', 'udp']:
+                            parsed_data['source_port'] = filter_fields[20] if filter_fields[20] else None
+                            parsed_data['dest_port'] = filter_fields[21] if filter_fields[21] else None
+
+                return parsed_data
+
+        except Exception as e:
+            logger.debug(f"Error parsing filter log line: {e}")
 
         return self.parse_generic_log_line(line, log_file)
 
@@ -580,15 +621,15 @@ class PfSenseClient:
             'raw_message': line
         }
 
-    def compress_logs(self, logs: List[Dict[str, Any]]) -> str:
-        """Compress logs data using gzip"""
+    def compress_raw_logs(self, raw_logs: List[Dict[str, Any]]) -> str:
+        """Compress raw log files using gzip"""
         try:
             import base64
-            logs_json = json.dumps(logs)
+            logs_json = json.dumps(raw_logs)
             compressed = gzip.compress(logs_json.encode('utf-8'))
             return base64.b64encode(compressed).decode('utf-8')
         except Exception as e:
-            logger.error(f"Error compressing logs: {e}")
+            logger.error(f"Error compressing raw logs: {e}")
             return ""
 
     async def get_system_status(self) -> Dict[str, Any]:
@@ -644,12 +685,195 @@ class PfSenseClient:
                     'count': psutil.cpu_count()
                 },
                 'network': network_stats,
+                'wan_monitoring': await self.get_wan_status(),
                 'timestamp': datetime.now().isoformat()
             }
 
         except Exception as e:
             logger.error(f"Error getting system status: {e}")
             return {'status': 'error', 'message': str(e)}
+
+    async def get_wan_status(self) -> Dict[str, Any]:
+        """Get WAN interface and gateway monitoring information"""
+        try:
+            wan_info = {}
+
+            # Get WAN interface statistics with enhanced metrics
+            wan_interfaces = self.get_wan_interfaces()
+            for interface in wan_interfaces:
+                if interface in psutil.net_io_counters(pernic=True):
+                    stats = psutil.net_io_counters(pernic=True)[interface]
+                    wan_info[interface] = {
+                        'bytes_sent': getattr(stats, 'bytes_sent', 0),
+                        'bytes_recv': getattr(stats, 'bytes_recv', 0),
+                        'packets_sent': getattr(stats, 'packets_sent', 0),
+                        'packets_recv': getattr(stats, 'packets_recv', 0),
+                        'errors_in': getattr(stats, 'errin', 0),
+                        'errors_out': getattr(stats, 'errout', 0),
+                        'drops_in': getattr(stats, 'dropin', 0),
+                        'drops_out': getattr(stats, 'dropout', 0),
+                        'gateway_monitoring': await self.ping_gateway(interface)
+                    }
+
+            return {
+                'status': 'success',
+                'wan_interfaces': wan_info,
+                'routing_table': self.get_routing_info(),
+                'timestamp': datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error getting WAN status: {e}")
+            return {'status': 'error', 'error': str(e)}
+
+    def get_wan_interfaces(self) -> List[str]:
+        """Identify WAN interfaces (typically vtnet0, em0, etc.)"""
+        try:
+            # Common pfSense WAN interface names
+            potential_wan = ['vtnet0', 'em0', 'igb0', 're0', 'bce0', 'bge0']
+            wan_interfaces = []
+
+            available_interfaces = list(psutil.net_io_counters(pernic=True).keys())
+            for interface in potential_wan:
+                if interface in available_interfaces:
+                    wan_interfaces.append(interface)
+
+            # If no common WAN interfaces found, try to detect from routing
+            if not wan_interfaces:
+                try:
+                    # Get default route interface
+                    result = subprocess.run(['route', 'get', 'default'],
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        for line in result.stdout.split('\n'):
+                            if 'interface:' in line:
+                                interface = line.split(':')[1].strip()
+                                if interface in available_interfaces:
+                                    wan_interfaces.append(interface)
+                                break
+                except Exception:
+                    pass
+
+            return wan_interfaces if wan_interfaces else ['vtnet0']  # Default fallback
+        except Exception as e:
+            logger.error(f"Error identifying WAN interfaces: {e}")
+            return ['vtnet0']
+
+    async def ping_gateway(self, interface: str) -> Dict[str, Any]:
+        """Ping the gateway for the specified interface to measure WAN quality"""
+        try:
+            # Get gateway IP for this interface
+            gateway_ip = self.get_gateway_for_interface(interface)
+            if not gateway_ip:
+                return {'status': 'no_gateway', 'interface': interface}
+
+            # Ping gateway 5 times to get quality metrics
+            ping_results = []
+            for _ in range(5):
+                try:
+                    # Use FreeBSD/pfSense compatible ping flags (-c 1); rely on subprocess timeout
+                    result = subprocess.run(
+                        ['ping', '-c', '1', gateway_ip],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if result.returncode == 0:
+                        # Extract ping time from output
+                        for line in result.stdout.split('\n'):
+                            if 'time=' in line:
+                                time_str = line.split('time=')[1].split()[0]
+                                ping_time = float(time_str)
+                                ping_results.append(ping_time)
+                                break
+                except Exception:
+                    continue
+
+                # Small delay between pings
+                await asyncio.sleep(0.2)
+
+            if ping_results:
+                avg_latency = sum(ping_results) / len(ping_results)
+                packet_loss = ((5 - len(ping_results)) / 5) * 100
+                return {
+                    'status': 'success',
+                    'gateway_ip': gateway_ip,
+                    'interface': interface,
+                    'avg_latency_ms': round(avg_latency, 2),
+                    'packet_loss_percent': packet_loss,
+                    'ping_count': len(ping_results),
+                    'latency_samples': ping_results
+                }
+            else:
+                return {
+                    'status': 'failed',
+                    'gateway_ip': gateway_ip,
+                    'interface': interface,
+                    'error': 'All pings failed'
+                }
+
+        except Exception as e:
+            logger.error(f"Error pinging gateway for {interface}: {e}")
+            return {'status': 'error', 'interface': interface, 'error': str(e)}
+
+    def get_gateway_for_interface(self, interface: str) -> str:
+        """Get the gateway IP for a specific interface"""
+        try:
+            # Try to get default gateway first
+            result = subprocess.run(['route', 'get', 'default'],
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                gateway_ip = None
+                interface_match = False
+
+                for line in result.stdout.split('\n'):
+                    if 'gateway:' in line:
+                        gateway_ip = line.split(':')[1].strip()
+                    elif 'interface:' in line and interface in line:
+                        interface_match = True
+
+                if gateway_ip and interface_match:
+                    return gateway_ip
+
+            # Fallback: try to parse routing table
+            result = subprocess.run(['netstat', '-rn'],
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'default' in line or '0.0.0.0' in line:
+                        parts = line.split()
+                        if len(parts) >= 4 and interface in line:
+                            return parts[1]  # Gateway IP
+
+            return None
+        except Exception as e:
+            logger.error(f"Error getting gateway for {interface}: {e}")
+            return None
+
+    def get_routing_info(self) -> Dict[str, Any]:
+        """Get basic routing table information"""
+        try:
+            result = subprocess.run(['netstat', '-rn'],
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                routes = []
+                for line in result.stdout.split('\n'):
+                    if 'default' in line or '0.0.0.0' in line:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            routes.append({
+                                'destination': parts[0],
+                                'gateway': parts[1],
+                                'interface': parts[-1] if len(parts) > 4 else 'unknown'
+                            })
+
+                return {
+                    'status': 'success',
+                    'default_routes': routes,
+                    'route_count': len(routes)
+                }
+            else:
+                return {'status': 'error', 'error': 'Failed to get routing info'}
+        except Exception as e:
+            logger.error(f"Error getting routing info: {e}")
+            return {'status': 'error', 'error': str(e)}
 
     async def get_firewall_rules(self) -> Dict[str, Any]:
         """Get current firewall rules"""
@@ -784,6 +1008,68 @@ class PfSenseClient:
 
     # HTTP polling methods removed - WebSocket only mode
 
+    async def update_client_files(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Update local client .py files from HQ payload and optionally restart."""
+        try:
+            files = params.get('files', [])
+            if not files:
+                return {"status": "error", "message": "No files provided"}
+
+            updated = []
+            for f in files:
+                name = f.get('name') or os.path.basename(f.get('path', ''))
+                target = f.get('target') or ("/usr/local/bin/" + name)
+                content_b64 = f.get('content_b64')
+                mode = f.get('mode', '0644')
+                if not content_b64:
+                    continue
+                data = base64.b64decode(content_b64)
+                # Ensure dir exists
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # Write atomically
+                tmp_path = target + ".tmp"
+                with open(tmp_path, 'wb') as out:
+                    out.write(data)
+                os.replace(tmp_path, target)
+                # Permissions
+                try:
+                    perm = int(mode, 8)
+                    os.chmod(target, perm)
+                except Exception:
+                    pass
+                updated.append(target)
+
+            # Restart if requested
+            restart = params.get('restart', True)
+            restarted = False
+            if restart:
+                # Prefer restart script if present
+                if os.path.exists('/usr/local/bin/restart_client.sh'):
+                    try:
+                        subprocess.Popen(['sh', '-c', '/usr/local/bin/restart_client.sh >/dev/null 2>&1 &'])
+                        restarted = True
+                    except Exception as e:
+                        logger.error(f"Failed to invoke restart script: {e}")
+                else:
+                    # Fallback: re-exec self as daemon
+                    try:
+                        py = shutil.which('python3') or shutil.which('python') or sys.executable
+                        subprocess.Popen(['sh', '-c', f'nohup {py} /usr/local/bin/pfsense_client.py --daemon >/dev/null 2>&1 &'])
+                        # Exit current process after spawning new one
+                        restarted = True
+                    except Exception as e:
+                        logger.error(f"Failed to re-exec client: {e}")
+
+            return {
+                "status": "success",
+                "updated_files": updated,
+                "restarted": restarted,
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Update failed: {e}")
+            return {"status": "error", "message": str(e)}
+
     async def run(self):
         """Main client loop - WebSocket only"""
         logger.info(f"Starting pfSense client {self.client_id} (WebSocket mode)")
@@ -820,6 +1106,237 @@ class PfSenseClient:
                 except:
                     pass
             logger.info("pfSense client stopped")
+
+    async def get_wan_performance_analysis(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze WAN performance and provide insights"""
+        try:
+            # Get current WAN status
+            wan_status = await self.get_wan_status()
+
+            # Get historical interface statistics if available
+            interface_history = self.get_interface_history()
+
+            # Analyze performance
+            analysis = {
+                'current_status': wan_status,
+                'performance_analysis': self.analyze_wan_performance(wan_status),
+                'bandwidth_analysis': self.analyze_bandwidth_usage(),
+                'quality_metrics': self.calculate_wan_quality_metrics(wan_status),
+                'recommendations': self.generate_wan_recommendations(wan_status),
+                'timestamp': datetime.now().isoformat()
+            }
+
+            return {
+                'status': 'success',
+                'analysis': analysis,
+                'client_id': self.client_id,
+                'client_name': self.client_name
+            }
+
+        except Exception as e:
+            logger.error(f"Error analyzing WAN performance: {e}")
+            return {'status': 'error', 'error': str(e)}
+
+    def analyze_wan_performance(self, wan_status: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze WAN performance metrics"""
+        try:
+            analysis = {
+                'overall_status': 'unknown',
+                'interface_analysis': {},
+                'gateway_quality': {},
+                'issues_detected': []
+            }
+
+            if wan_status.get('status') != 'success':
+                analysis['overall_status'] = 'error'
+                analysis['issues_detected'].append('Failed to collect WAN status')
+                return analysis
+
+            wan_interfaces = wan_status.get('wan_interfaces', {})
+            healthy_interfaces = 0
+            total_interfaces = len(wan_interfaces)
+
+            for interface, stats in wan_interfaces.items():
+                gateway_monitoring = stats.get('gateway_monitoring', {})
+                interface_analysis = {
+                    'status': 'unknown',
+                    'quality_score': 0,
+                    'issues': []
+                }
+
+                if gateway_monitoring.get('status') == 'success':
+                    latency = gateway_monitoring.get('avg_latency_ms', 0)
+                    packet_loss = gateway_monitoring.get('packet_loss_percent', 0)
+
+                    interface_analysis['status'] = 'healthy'
+                    interface_analysis['latency_ms'] = latency
+                    interface_analysis['packet_loss_percent'] = packet_loss
+                    interface_analysis['quality_score'] = self.calculate_quality_score(latency, packet_loss)
+
+                    # Check for issues
+                    if latency > 100:
+                        interface_analysis['issues'].append(f'High latency: {latency}ms')
+                    if packet_loss > 5:
+                        interface_analysis['issues'].append(f'High packet loss: {packet_loss}%')
+
+                    if not interface_analysis['issues']:
+                        healthy_interfaces += 1
+                else:
+                    interface_analysis['status'] = 'failed'
+                    interface_analysis['issues'].append('Gateway monitoring failed')
+
+                analysis['interface_analysis'][interface] = interface_analysis
+                analysis['gateway_quality'][interface] = gateway_monitoring
+
+            # Overall status
+            if healthy_interfaces == total_interfaces and total_interfaces > 0:
+                analysis['overall_status'] = 'healthy'
+            elif healthy_interfaces > 0:
+                analysis['overall_status'] = 'degraded'
+            else:
+                analysis['overall_status'] = 'failed'
+
+            return analysis
+
+        except Exception as e:
+            logger.error(f"Error analyzing WAN performance: {e}")
+            return {'overall_status': 'error', 'error': str(e)}
+
+    def calculate_quality_score(self, latency: float, packet_loss: float) -> int:
+        """Calculate a quality score (0-100) based on latency and packet loss"""
+        try:
+            # Start with perfect score
+            score = 100
+
+            # Deduct points for latency
+            if latency > 20:
+                score -= min(40, (latency - 20) * 0.5)  # Max 40 points deduction
+
+            # Deduct points for packet loss
+            score -= packet_loss * 10  # 10 points per 1% packet loss
+
+            return max(0, int(score))
+        except:
+            return 0
+
+    def analyze_bandwidth_usage(self) -> Dict[str, Any]:
+        """Analyze bandwidth usage patterns"""
+        try:
+            # This is a simplified analysis - in production you'd want to track
+            # bandwidth usage over time and compare to baselines
+            network_stats = psutil.net_io_counters(pernic=True)
+
+            analysis = {
+                'total_bytes_sent': 0,
+                'total_bytes_received': 0,
+                'interface_usage': {}
+            }
+
+            for interface, stats in network_stats.items():
+                if interface.startswith(('vtnet', 'em', 'igb', 're', 'bce', 'bge')):
+                    analysis['total_bytes_sent'] += stats.bytes_sent
+                    analysis['total_bytes_received'] += stats.bytes_recv
+                    analysis['interface_usage'][interface] = {
+                        'bytes_sent': stats.bytes_sent,
+                        'bytes_received': stats.bytes_recv,
+                        'total_bytes': stats.bytes_sent + stats.bytes_recv
+                    }
+
+            return analysis
+
+        except Exception as e:
+            logger.error(f"Error analyzing bandwidth usage: {e}")
+            return {'error': str(e)}
+
+    def calculate_wan_quality_metrics(self, wan_status: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate overall WAN quality metrics"""
+        try:
+            metrics = {
+                'average_latency': 0,
+                'average_packet_loss': 0,
+                'overall_quality_score': 0,
+                'interface_count': 0
+            }
+
+            wan_interfaces = wan_status.get('wan_interfaces', {})
+            if not wan_interfaces:
+                return metrics
+
+            total_latency = 0
+            total_packet_loss = 0
+            valid_interfaces = 0
+
+            for interface, stats in wan_interfaces.items():
+                gateway_monitoring = stats.get('gateway_monitoring', {})
+                if gateway_monitoring.get('status') == 'success':
+                    total_latency += gateway_monitoring.get('avg_latency_ms', 0)
+                    total_packet_loss += gateway_monitoring.get('packet_loss_percent', 0)
+                    valid_interfaces += 1
+
+            if valid_interfaces > 0:
+                metrics['average_latency'] = round(total_latency / valid_interfaces, 2)
+                metrics['average_packet_loss'] = round(total_packet_loss / valid_interfaces, 2)
+                metrics['overall_quality_score'] = self.calculate_quality_score(
+                    metrics['average_latency'],
+                    metrics['average_packet_loss']
+                )
+
+            metrics['interface_count'] = valid_interfaces
+            return metrics
+
+        except Exception as e:
+            logger.error(f"Error calculating WAN quality metrics: {e}")
+            return {'error': str(e)}
+
+    def generate_wan_recommendations(self, wan_status: Dict[str, Any]) -> List[str]:
+        """Generate recommendations based on WAN analysis"""
+        try:
+            recommendations = []
+
+            wan_interfaces = wan_status.get('wan_interfaces', {})
+            for interface, stats in wan_interfaces.items():
+                gateway_monitoring = stats.get('gateway_monitoring', {})
+
+                if gateway_monitoring.get('status') == 'success':
+                    latency = gateway_monitoring.get('avg_latency_ms', 0)
+                    packet_loss = gateway_monitoring.get('packet_loss_percent', 0)
+
+                    if latency > 100:
+                        recommendations.append(f"High latency on {interface} ({latency}ms) - check ISP connection")
+                    if packet_loss > 5:
+                        recommendations.append(f"High packet loss on {interface} ({packet_loss}%) - investigate network issues")
+                elif gateway_monitoring.get('status') == 'failed':
+                    recommendations.append(f"Gateway monitoring failed for {interface} - check connectivity")
+
+                # Check error rates
+                total_packets = stats.get('packets_recv', 0)
+                errors = stats.get('errors_in', 0)
+                if total_packets > 1000 and errors > 0:
+                    error_rate = (errors / total_packets) * 100
+                    if error_rate > 1.0:
+                        recommendations.append(f"High error rate on {interface} ({error_rate:.2f}%) - check cable/hardware")
+
+            if not recommendations:
+                recommendations.append("WAN performance appears normal - no issues detected")
+
+            return recommendations
+
+        except Exception as e:
+            logger.error(f"Error generating WAN recommendations: {e}")
+            return [f"Error generating recommendations: {str(e)}"]
+
+    def get_interface_history(self) -> Dict[str, Any]:
+        """Get historical interface statistics (placeholder for future implementation)"""
+        # This would be implemented to track interface statistics over time
+        # For now, return current snapshot
+        try:
+            return {
+                'status': 'not_implemented',
+                'message': 'Historical tracking not yet implemented',
+                'current_snapshot': {}
+            }
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
 
 def main():
     """Main entry point"""

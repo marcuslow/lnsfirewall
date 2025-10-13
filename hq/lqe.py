@@ -102,15 +102,28 @@ class LogQueryEngine:
 
         This ensures we only analyze EXTERNAL attackers, not internal traffic.
         """
-        if not ip_str or ip_str in ['RTALERT', '0.0.0.0', '']:
+        if not ip_str or ip_str in ['RTALERT', '0.0.0.0', '', 'None', 'null']:
             return False
+
+        # Additional validation for common invalid formats
+        if not isinstance(ip_str, str):
+            return False
+
+        # Strip whitespace and check for empty
+        ip_str = ip_str.strip()
+        if not ip_str:
+            return False
+
         try:
             ip_obj = ipaddress.ip_address(ip_str)
             # Filter out private/internal IPs - these are NOT external attackers
             if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
                 return False
             return True
-        except ValueError:
+        except (ValueError, TypeError, AttributeError) as e:
+            # Log problematic IPs for debugging
+            if ip_str not in ['RTALERT', '0.0.0.0', '', 'None', 'null']:
+                logger.debug(f"Invalid IP format: '{ip_str}' - {e}")
             return False
 
     # Filters
@@ -328,7 +341,39 @@ class LogQueryEngine:
         ip_to_country = {}
         ips_needing_lookup = set(unique_ips)
 
-        if cache_db_path:
+        # Use PostgreSQL for caching (always enabled now)
+        try:
+            import psycopg2
+            import psycopg2.extras
+            from db_config import POSTGRES_CONFIG
+            conn = psycopg2.connect(**POSTGRES_CONFIG)
+            cur = conn.cursor()
+
+            # Query cache
+            cur.execute('''
+                SELECT ip, country_code, country_name, city, region, org, source
+                FROM ip_geolocation_cache
+                WHERE ip = ANY(%s)
+            ''', (list(unique_ips),))
+
+            cached_results = cur.fetchall()
+            for row in cached_results:
+                ip_to_country[row[0]] = {
+                    'country_code': row[1],
+                    'country_name': row[2],
+                    'city': row[3],
+                    'region': row[4],
+                    'org': row[5],
+                    'source': row[6]
+                }
+                ips_needing_lookup.discard(row[0])
+
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to load GeoIP cache: {e}")
+
+        # Old SQLite cache code (disabled)
+        if False:
             try:
                 import sqlite3
                 conn = sqlite3.connect(cache_db_path)
@@ -426,20 +471,29 @@ class LogQueryEngine:
                     reader.close()
                     logger.info(f"GeoIP2 resolved {len(ips_resolved_by_geoip2)} IPs, {len(ips_needing_lookup)} still need lookup")
 
-                    # Cache GeoIP2 results
-                    if cache_db_path and ips_resolved_by_geoip2:
+                    # Cache GeoIP2 results to PostgreSQL
+                    if ips_resolved_by_geoip2:
                         try:
-                            import sqlite3
-                            conn = sqlite3.connect(cache_db_path)
+                            import psycopg2
+                            from db_config import POSTGRES_CONFIG
+                            conn = psycopg2.connect(**POSTGRES_CONFIG)
                             cur = conn.cursor()
                             for ip in ips_resolved_by_geoip2:
                                 data = ip_to_country[ip]
                                 cur.execute('''
-                                    INSERT OR REPLACE INTO ip_geolocation_cache
-                                    (ip, country_code, country_name, city, region, org)
-                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    INSERT INTO ip_geolocation_cache
+                                    (ip, country_code, country_name, city, region, org, source)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (ip) DO UPDATE SET
+                                        country_code = EXCLUDED.country_code,
+                                        country_name = EXCLUDED.country_name,
+                                        city = EXCLUDED.city,
+                                        region = EXCLUDED.region,
+                                        org = EXCLUDED.org,
+                                        source = EXCLUDED.source,
+                                        cached_at = CURRENT_TIMESTAMP
                                 ''', (ip, data['country_code'], data['country_name'],
-                                      data['city'], data['region'], data['org']))
+                                      data['city'], data['region'], data['org'], 'geoip2_offline'))
                             conn.commit()
                             conn.close()
                             logger.info(f"Cached {len(ips_resolved_by_geoip2)} GeoIP2 results")
@@ -473,7 +527,6 @@ class LogQueryEngine:
                 logger.warning(f"Too many IPs to check ({len(ips_needing_lookup)}). Prioritizing top {max_api_lookups} most frequent attackers.")
 
                 # Count how many times each IP appears in blocked logs
-                from collections import Counter
                 ip_counts = Counter(entry.src for entry in entries_to_analyze if entry.src and self.is_valid_external_ip(entry.src))
 
                 # Get top N most frequent IPs that need lookup
@@ -490,43 +543,51 @@ class LogQueryEngine:
                 # Batch lookup for efficiency
                 details = handler.getBatchDetails(ips_to_lookup)
 
-                # Cache the results
-                if cache_db_path:
-                    try:
-                        import sqlite3
-                        conn = sqlite3.connect(cache_db_path)
-                        cur = conn.cursor()
+                # Cache the results to PostgreSQL
+                try:
+                    import psycopg2
+                    from db_config import POSTGRES_CONFIG
+                    conn = psycopg2.connect(**POSTGRES_CONFIG)
+                    cur = conn.cursor()
 
-                        for ip, detail in details.items():
-                            # getBatchDetails() returns dict[str, dict], not dict[str, Details]
-                            # Single getDetails() returns Details object with .all, but batch returns plain dicts
-                            data = detail if isinstance(detail, dict) else (detail.all if hasattr(detail, 'all') else {})
-                            country_code = data.get('country', None)
-                            country_name = data.get('country_name', None)
-                            city = data.get('city', None)
-                            region = data.get('region', None)
-                            org = data.get('org', None)
+                    for ip, detail in details.items():
+                        # getBatchDetails() returns dict[str, dict], not dict[str, Details]
+                        # Single getDetails() returns Details object with .all, but batch returns plain dicts
+                        data = detail if isinstance(detail, dict) else (detail.all if hasattr(detail, 'all') else {})
+                        country_code = data.get('country', None)
+                        country_name = data.get('country_name', None)
+                        city = data.get('city', None)
+                        region = data.get('region', None)
+                        org = data.get('org', None)
 
-                            cur.execute('''
-                                INSERT OR REPLACE INTO ip_geolocation_cache
-                                (ip, country_code, country_name, city, region, org)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                            ''', (ip, country_code, country_name, city, region, org))
+                        cur.execute('''
+                            INSERT INTO ip_geolocation_cache
+                            (ip, country_code, country_name, city, region, org, source)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (ip) DO UPDATE SET
+                                country_code = EXCLUDED.country_code,
+                                country_name = EXCLUDED.country_name,
+                                city = EXCLUDED.city,
+                                region = EXCLUDED.region,
+                                org = EXCLUDED.org,
+                                source = EXCLUDED.source,
+                                cached_at = CURRENT_TIMESTAMP
+                        ''', (ip, country_code, country_name, city, region, org, 'ipinfo_api'))
 
-                            ip_to_country[ip] = {
-                                'country_code': country_code,
-                                'country_name': country_name,
-                                'city': city,
-                                'region': region,
-                                'org': org,
-                                'cached': False
-                            }
+                        ip_to_country[ip] = {
+                            'country_code': country_code,
+                            'country_name': country_name,
+                            'city': city,
+                            'region': region,
+                            'org': org,
+                            'cached': False
+                        }
 
-                        conn.commit()
-                        conn.close()
-                        logger.info(f"Cached {len(details)} new IP lookups")
-                    except Exception as e:
-                        logger.warning(f"Failed to cache results: {e}")
+                    conn.commit()
+                    conn.close()
+                    logger.info(f"Cached {len(details)} new IP lookups")
+                except Exception as e:
+                    logger.warning(f"Failed to cache results: {e}")
                 else:
                     # No caching, just store in memory
                     for ip, detail in details.items():
@@ -712,7 +773,6 @@ class LogQueryEngine:
                 logger.warning(f"Too many IPs to check ({len(ips_needing_lookup)}). Prioritizing top {max_api_lookups} most frequent attackers.")
 
                 # Count how many times each IP appears in blocked logs
-                from collections import Counter
                 ip_counts = Counter(entry.src for entry in entries_to_analyze if entry.src and self.is_valid_external_ip(entry.src))
 
                 # Get top N most frequent IPs that need lookup
@@ -1039,50 +1099,100 @@ class LogQueryEngine:
         }
 
     @staticmethod
-    def from_db(db_path: str, client_id: Optional[str], since_days: int = 7) -> "LogQueryEngine":
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
+    def from_db(db_path: str, client_id: Optional[str], since_days: int = 7, sample_rate: int = 10) -> "LogQueryEngine":
+        import psycopg2
+        import psycopg2.extras
+        from db_config import POSTGRES_CONFIG
+
+        conn = psycopg2.connect(**POSTGRES_CONFIG)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         start = (datetime.now() - timedelta(days=since_days)).isoformat()
 
         entries: List[Dict[str, Any]] = []
 
-        # First try the logs table (new storage method)
+        # Query individual log entries from log_entries table (production storage)
         if client_id:
-            cur.execute(
-                """
-                SELECT log_data, compressed
-                FROM logs
-                WHERE (client_id = ?) AND (timestamp >= ?)
-                ORDER BY timestamp DESC
-                """,
-                (client_id, start),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT log_data, compressed
-                FROM logs
-                WHERE (timestamp >= ?)
-                ORDER BY timestamp DESC
-                """,
-                (start,),
-            )
+            # Normalize client_id to lowercase for consistent lookup
+            normalized_client_id = client_id.lower()
 
-        for log_data, compressed in cur.fetchall():
-            if compressed:
-                try:
-                    payload = gzip.decompress(base64.b64decode(log_data.encode("utf-8"))).decode("utf-8")
-                except Exception:
-                    continue
+            # Apply sampling at the database level for better performance
+            if sample_rate > 1:
+                # Use modulo on id for consistent sampling
+                cur.execute(
+                    """
+                    SELECT log_timestamp, source, log_type, hostname, raw_message,
+                           rule_number, interface, action, direction, protocol,
+                           source_ip, dest_ip, source_port, dest_port
+                    FROM log_entries
+                    WHERE (client_id = %s) AND (timestamp >= %s) AND (id %% %s = 0)
+                    ORDER BY timestamp DESC
+                    """,
+                    (normalized_client_id, start, sample_rate),
+                )
             else:
-                payload = log_data
+                cur.execute(
+                    """
+                    SELECT log_timestamp, source, log_type, hostname, raw_message,
+                           rule_number, interface, action, direction, protocol,
+                           source_ip, dest_ip, source_port, dest_port
+                    FROM log_entries
+                    WHERE (client_id = %s) AND (timestamp >= %s)
+                    ORDER BY timestamp DESC
+                    """,
+                    (normalized_client_id, start),
+                )
+        else:
+            # Query all clients
+            if sample_rate > 1:
+                cur.execute(
+                    """
+                    SELECT log_timestamp, source, log_type, hostname, raw_message,
+                           rule_number, interface, action, direction, protocol,
+                           source_ip, dest_ip, source_port, dest_port
+                    FROM log_entries
+                    WHERE (timestamp >= %s) AND (id %% %s = 0)
+                    ORDER BY timestamp DESC
+                    """,
+                    (start, sample_rate),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT log_timestamp, source, log_type, hostname, raw_message,
+                           rule_number, interface, action, direction, protocol,
+                           source_ip, dest_ip, source_port, dest_port
+                    FROM log_entries
+                    WHERE (timestamp >= %s)
+                    ORDER BY timestamp DESC
+                    """,
+                    (start,),
+                )
+
+        # Convert database rows to dict format
+        for row in cur.fetchall():
             try:
-                chunk = json.loads(payload)
-                if isinstance(chunk, list):
-                    entries.extend(chunk)
-            except Exception:
+                entry = {
+                    'timestamp': row['log_timestamp'],
+                    'source': row['source'],
+                    'log_type': row['log_type'],
+                    'hostname': row['hostname'],
+                    'raw_message': row['raw_message'],
+                    'rule_number': row['rule_number'],
+                    'interface': row['interface'],
+                    'action': row['action'],
+                    'direction': row['direction'],
+                    'protocol': row['protocol'],
+                    'source_ip': row['source_ip'],
+                    'dest_ip': row['dest_ip'],
+                    'source_port': row['source_port'],
+                    'dest_port': row['dest_port'],
+                }
+                entries.append(entry)
+            except Exception as e:
+                logger.warning(f"Failed to parse log entry: {e}")
                 continue
+
+        logger.info(f"Loaded {len(entries)} log entries from log_entries table (sample_rate: {sample_rate})")
 
         # If no entries found in logs table, try command responses (fallback for existing data)
         if not entries:
@@ -1091,7 +1201,7 @@ class LogQueryEngine:
                     """
                     SELECT response_data
                     FROM commands
-                    WHERE (client_id = ?) AND (command_type = 'get_logs') AND (status = 'completed') AND (created_at >= ?)
+                    WHERE (client_id = %s) AND (command_type = 'get_logs') AND (status = 'completed') AND (created_at >= %s)
                     ORDER BY created_at DESC
                     """,
                     (client_id, start),
@@ -1101,13 +1211,14 @@ class LogQueryEngine:
                     """
                     SELECT response_data
                     FROM commands
-                    WHERE (command_type = 'get_logs') AND (status = 'completed') AND (created_at >= ?)
+                    WHERE (command_type = 'get_logs') AND (status = 'completed') AND (created_at >= %s)
                     ORDER BY created_at DESC
                     """,
                     (start,),
                 )
 
-            for (response_data,) in cur.fetchall():
+            for row in cur.fetchall():
+                response_data = row['response_data'] if isinstance(row, dict) else row[0]
                 if response_data:
                     try:
                         response = json.loads(response_data)

@@ -27,6 +27,9 @@ hq_database.db
 *.log
 *.bak
 
+# Temp directory for log processing
+temp/
+
 # Compiled
 *.pyd
 *.pyo

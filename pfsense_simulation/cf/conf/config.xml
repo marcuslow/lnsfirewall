@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<pfsense>
+    <version>2.7.0</version>
+    <system>
+        <hostname>test-wrapper</hostname>
+        <domain>local</domain>
+    </system>
+    <interfaces>
+        <wan>
+            <enable/>
+            <if>em0</if>
+            <ipaddr>dhcp</ipaddr>
+        </wan>
+        <lan>
+            <enable/>
+            <if>em1</if>
+            <ipaddr>192.168.1.1</ipaddr>
+            <subnet>24</subnet>
+        </lan>
+    </interfaces>
+    <filter><rule>
+            <type>block</type>
+            <interface>wan</interface>
+            <ipprotocol>inet</ipprotocol>
+            <statetype>keep state</statetype>
+            <direction>in</direction>
+            <floating>yes</floating>
+            <quick>yes</quick>
+            <source>
+                <any />
+            </source>
+            <destination>
+                <any />
+            </destination>
+            <descr>Default block rule</descr>
+        </rule>
+        <rule>
+            <type>pass</type>
+            <interface>lan</interface>
+            <ipprotocol>inet</ipprotocol>
+            <statetype>keep state</statetype>
+            <direction>in</direction>
+            <source>
+                <network>lan</network>
+            </source>
+            <destination>
+                <any />
+            </destination>
+            <descr>Default LAN to any rule</descr>
+        </rule></filter>
+</pfsense>

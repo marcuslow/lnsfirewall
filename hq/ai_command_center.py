@@ -8,15 +8,20 @@ import asyncio
 import json
 import logging
 import os
+import sys
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import openai
-import aiosqlite
 import gzip
 import base64
 from dotenv import load_dotenv
 import requests
 import re
+
+# Add hq directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from db_async import get_db, get_command_status
 
 # Local RQE (Rules Query Engine)
 try:
@@ -657,14 +662,14 @@ class AICommandCenter:
                     status_data = status_res.json()
                     if status_data.get("success") and status_data.get("age_minutes", 999) < 5:
                         # Get the actual rules XML from the database
-                        async with aiosqlite.connect(self.db_path) as db:
+                        async with get_db() as db:
                             cursor = await db.execute('''
-                                SELECT rules_xml FROM rulesets
-                                WHERE client_id = ? AND ruleset_id = ?
-                            ''', (actual_client_id, status_data.get("ruleset_id")))
-                            rules_result = await cursor.fetchone()
+                                SELECT rules_xml FROM firewall_rules
+                                WHERE client_id = %s AND ruleset_id = %s
+                            ''', (actual_client_id, status_data.get("latest_ruleset_id")))
+                            rules_result = await db.fetchone(cursor)
 
-                            rules_xml = rules_result[0] if rules_result else ""
+                            rules_xml = rules_result.get('rules_xml', '') if rules_result else ""
 
                         return {
                             "success": True,
@@ -696,38 +701,35 @@ class AICommandCenter:
             while time.time() - start_time < max_wait:
                 try:
                     # Check if response is available in database using ACTUAL client ID
-                    async with aiosqlite.connect(self.db_path) as db:
-                        cursor = await db.execute('''
-                            SELECT status, response_data FROM commands
-                            WHERE id = ?
-                        ''', (command_id,))
-                        result = await cursor.fetchone()
+                    result = await get_command_status(command_id)
 
-                        if result and result[0] == 'completed':
-                            response_data = json.loads(result[1]) if result[1] else {}
-                            if response_data.get('status') == 'success':
-                                rules_xml = response_data.get('rules_xml', '')
-                                try:
-                                    ing = requests.post(f"{self.hq_url}/rules/ingest", json={
-                                        "client_id": actual_client_id,
-                                        "rules_xml": rules_xml,
-                                        "command_id": command_id
-                                    }, timeout=30)
-                                    ing.raise_for_status()
-                                    ingest_info = ing.json()
-                                except Exception as e:
-                                    ingest_info = {"success": False, "error": str(e)}
-                                return {
-                                    "success": True,
-                                    "message": f"Fresh firewall rules retrieved and indexed for {client_id}",
-                                    "ruleset_id": ingest_info.get("ruleset_id"),
-                                    "ingested_at": ingest_info.get("ingested_at"),
-                                    "rule_count": ingest_info.get("rule_count"),
-                                    "size_bytes": ingest_info.get("size_bytes"),
-                                    "cached": False
-                                }
-                            else:
-                                return {"success": False, "error": response_data.get('message', 'Unknown error')}
+                    if result and result.get('status') == 'completed':
+                        response_data = result.get('response_data', {})
+                        if isinstance(response_data, str):
+                            response_data = json.loads(response_data)
+                        if response_data.get('status') == 'success':
+                            rules_xml = response_data.get('rules_xml', '')
+                            try:
+                                ing = requests.post(f"{self.hq_url}/rules/ingest", json={
+                                    "client_id": actual_client_id,
+                                    "rules_xml": rules_xml,
+                                    "command_id": command_id
+                                }, timeout=30)
+                                ing.raise_for_status()
+                                ingest_info = ing.json()
+                            except Exception as e:
+                                ingest_info = {"success": False, "error": str(e)}
+                            return {
+                                "success": True,
+                                "message": f"Fresh firewall rules retrieved and indexed for {client_id}",
+                                "ruleset_id": ingest_info.get("ruleset_id"),
+                                "ingested_at": ingest_info.get("ingested_at"),
+                                "rule_count": ingest_info.get("rule_count"),
+                                "size_bytes": ingest_info.get("size_bytes"),
+                                "cached": False
+                            }
+                        else:
+                            return {"success": False, "error": response_data.get('message', 'Unknown error')}
 
                 except Exception as e:
                     logger.error(f"Error checking command response: {e}")
@@ -784,11 +786,11 @@ class AICommandCenter:
 
         print(f"\n📊 Monitoring progress for {client_name} (command: {command_id[:8]}...)")
 
-        max_wait = 120  # 2 minutes max
-        start_time = time.time()
+        max_wait = 120  # 2 minutes since last progress update
+        last_activity_time = time.time()
         last_progress = -1
 
-        while time.time() - start_time < max_wait:
+        while time.time() - last_activity_time < max_wait:
             try:
                 status_result = await self.get_command_status(command_id)
                 if not status_result.get("success"):
@@ -804,18 +806,66 @@ class AICommandCenter:
                     print(f"✅ {label} completed for {client_name}")
                     return {"status": "completed", "final_progress": progress_data}
                 elif status == "in_progress" and progress_data:
+                    # Reset timeout on any progress update
+                    last_activity_time = time.time()
                     progress_pct = progress_data.get("progress_pct", 0)
-                    files_done = progress_data.get("files_done", 0)
-                    files_total = progress_data.get("files_total", 0)
-                    current_file = progress_data.get("current_file", "")
+                    stage = progress_data.get("stage", "")
 
-                    # Only show progress if it changed
-                    if progress_pct != last_progress:
-                        bar_length = 20
-                        filled_length = int(bar_length * progress_pct // 100)
-                        bar = "█" * filled_length + "░" * (bar_length - filled_length)
-                        print(f"\r🔄 [{bar}] {progress_pct}% ({files_done}/{files_total}) {current_file}", end="", flush=True)
-                        last_progress = progress_pct
+                    # Different display based on stage
+                    if stage == "reading_logs":
+                        files_done = progress_data.get("files_done", 0)
+                        files_total = progress_data.get("files_total", 0)
+                        current_file = progress_data.get("current_file", "")
+
+                        if progress_pct != last_progress:
+                            bar_length = 20
+                            filled_length = int(bar_length * progress_pct // 100)
+                            bar = "█" * filled_length + "░" * (bar_length - filled_length)
+                            print(f"\r🔄 [{bar}] {progress_pct}% ({files_done}/{files_total}) {current_file}", end="", flush=True)
+                            last_progress = progress_pct
+
+                    elif stage == "sending_batches":
+                        batch_num = progress_data.get("batch_num", 0)
+                        total_batches = progress_data.get("total_batches", 0)
+
+                        if progress_pct != last_progress:
+                            bar_length = 20
+                            filled_length = int(bar_length * progress_pct // 100)
+                            bar = "█" * filled_length + "░" * (bar_length - filled_length)
+                            print(f"\r📤 [{bar}] {progress_pct}% - Sending batch {batch_num}/{total_batches}    ", end="", flush=True)
+                            last_progress = progress_pct
+
+                    elif stage == "receiving_batches":
+                        batch_num = progress_data.get("batch_num", 0)
+                        total_batches = progress_data.get("total_batches", 0)
+
+                        if progress_pct != last_progress:
+                            bar_length = 20
+                            filled_length = int(bar_length * progress_pct // 100)
+                            bar = "█" * filled_length + "░" * (bar_length - filled_length)
+                            print(f"\r📥 [{bar}] {progress_pct}% - Receiving batch {batch_num}/{total_batches}", end="", flush=True)
+                            last_progress = progress_pct
+
+                    elif stage == "storing_to_database":
+                        entries_inserted = progress_data.get("entries_inserted", 0)
+                        total_entries = progress_data.get("total_entries", 0)
+
+                        if progress_pct != last_progress:
+                            bar_length = 20
+                            filled_length = int(bar_length * progress_pct // 100)
+                            bar = "█" * filled_length + "░" * (bar_length - filled_length)
+                            print(f"\r💾 [{bar}] {progress_pct}% - Storing {entries_inserted:,}/{total_entries:,} entries", end="", flush=True)
+                            last_progress = progress_pct
+
+                    else:
+                        # Generic progress display for unknown stages
+                        if progress_pct != last_progress:
+                            bar_length = 20
+                            filled_length = int(bar_length * progress_pct // 100)
+                            bar = "█" * filled_length + "░" * (bar_length - filled_length)
+                            stage_display = stage.replace("_", " ").title() if stage else "Processing"
+                            print(f"\r⚙️  [{bar}] {progress_pct}% - {stage_display}", end="", flush=True)
+                            last_progress = progress_pct
 
                 await asyncio.sleep(1)  # Poll every second without blocking
 
@@ -823,8 +873,8 @@ class AICommandCenter:
                 print(f"\n❌ Error monitoring progress: {e}")
                 break
 
-        print(f"\n⏰ Progress monitoring timed out after {max_wait} seconds")
-        return {"status": "timeout", "elapsed": time.time() - start_time}
+        print(f"\n⏰ No progress updates received for {max_wait} seconds - command may still be running")
+        return {"status": "timeout", "last_activity": time.time() - last_activity_time}
 
     async def get_rules_status(self, client_id: str) -> Dict[str, Any]:
         """Get latest rules status for a client (age, ruleset_id, counts)"""
@@ -969,15 +1019,20 @@ class AICommandCenter:
                     return {"success": False, "error": f"Client '{client_id}' not found"}
 
             # Load latest cached rules XML from DB
-            async with aiosqlite.connect(self.db_path) as db:
+            async with get_db() as db:
+                # Normalize client_id to lowercase for consistent lookup
+                normalized_client_id = actual_client_id.lower()
                 cur = await db.execute(
-                    '''SELECT rules_xml, rule_count, ingested_at, id FROM rulesets WHERE client_id = ? ORDER BY ingested_at DESC LIMIT 1''',
-                    (actual_client_id,)
+                    '''SELECT rules_xml, rule_count, ingested_at, ruleset_id FROM firewall_rules WHERE client_id = %s ORDER BY ingested_at DESC LIMIT 1''',
+                    (normalized_client_id,)
                 )
-                row = await cur.fetchone()
+                row = await db.fetchone(cur)
                 if not row:
                     return {"success": False, "error": f"No cached rules found for client {client_id}. Use get_firewall_rules first."}
-                rules_xml, rule_count, ingested_at, ruleset_id = row
+                rules_xml = row.get('rules_xml', '')
+                rule_count = row.get('rule_count', 0)
+                ingested_at = row.get('ingested_at')
+                ruleset_id = row.get('ruleset_id')
 
             # Parse with RQE
             rqe = RulesQueryEngine(rules_xml)
@@ -1063,66 +1118,13 @@ class AICommandCenter:
             return {"success": False, "error": str(e)}
 
     async def get_stored_logs(self, client_id: Optional[str] = None, days: int = 7) -> Dict[str, Any]:
-        """Get stored logs from database"""
-        try:
-            start_date = datetime.now() - timedelta(days=days)
-
-            async with aiosqlite.connect(self.db_path) as db:
-                if client_id:
-                    cursor = await db.execute('''
-                        SELECT client_id, timestamp, log_data, compressed, size_bytes
-                        FROM logs
-                        WHERE client_id = ? AND timestamp >= ?
-                        ORDER BY timestamp DESC
-                    ''', (client_id, start_date))
-                else:
-                    cursor = await db.execute('''
-                        SELECT client_id, timestamp, log_data, compressed, size_bytes
-                        FROM logs
-                        WHERE timestamp >= ?
-                        ORDER BY timestamp DESC
-                    ''', (start_date,))
-
-                rows = await cursor.fetchall()
-
-                logs_data = []
-                total_size = 0
-
-                for row in rows:
-                    client_id_db, timestamp, log_data, compressed, size_bytes = row
-
-                    # Decompress if needed
-                    if compressed:
-                        try:
-                            compressed_data = base64.b64decode(log_data.encode('utf-8'))
-                            decompressed_data = gzip.decompress(compressed_data)
-                            log_entries = json.loads(decompressed_data.decode('utf-8'))
-                        except Exception as e:
-                            logger.error(f"Error decompressing logs: {e}")
-                            log_entries = []
-                    else:
-                        log_entries = json.loads(log_data)
-
-                    logs_data.append({
-                        'client_id': client_id_db,
-
-                        'timestamp': timestamp,
-                        'entries': log_entries,
-                        'size_bytes': size_bytes
-                    })
-
-                    total_size += size_bytes
-
-                return {
-                    "success": True,
-                    "logs": logs_data,
-                    "total_entries": sum(len(log['entries']) for log in logs_data),
-                    "total_size_bytes": total_size,
-                    "date_range": f"{start_date.isoformat()} to {datetime.now().isoformat()}"
-                }
-
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        """Get stored logs from database (DEPRECATED - use query_logs instead)"""
+        # This function is deprecated - the old 'logs' table doesn't exist in PostgreSQL
+        # Use query_logs() instead which queries the log_entries table
+        return {
+            "success": False,
+            "error": "get_stored_logs is deprecated. Use query_logs() instead."
+        }
 
     async def execute_function_call(self, function_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a function call from OpenAI"""
@@ -1145,10 +1147,9 @@ class AICommandCenter:
             elif function_name == "query_cached_rules":
                 return await self.query_cached_rules(arguments['client_id'], arguments['query'])
             elif function_name == "push_rules":
-
-                return await self.update_firewall_rules(
+                return await self.push_rules(
                     arguments['client_id'],
-                    arguments['rules_xml']
+                    arguments['ruleset_id']
                 )
             elif function_name == "restart_firewall":
                 return await self.restart_firewall(arguments['client_id'])
@@ -1186,32 +1187,69 @@ class AICommandCenter:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def _ensure_fresh_logs(self, client_id: str, max_age_hours: int = 6) -> Dict[str, Any]:
+    async def _ensure_fresh_logs(self, client_id: str, max_age_hours: int = 1) -> Dict[str, Any]:
         """
         Ensure logs are fresh (less than max_age_hours old).
         If logs are stale, automatically request fresh logs from client.
+
+        Default: 1 hour (changed from 6 hours to avoid unnecessary downloads)
 
         Returns:
             {"fresh": True/False, "age_hours": float, "refreshed": True/False}
         """
         try:
-            # Check when logs were last updated
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute('''
-                    SELECT MAX(timestamp) as last_log_time
-                    FROM logs
-                    WHERE client_id = ?
-                ''', (client_id,))
-                row = await cursor.fetchone()
+            # Resolve client_id to client_name for database lookup
+            client_name_for_db = client_id.lower()
+            try:
+                res = requests.get(f"{self.hq_url}/clients", timeout=30)
+                res.raise_for_status()
+                clients = res.json().get('clients', {})
+                for cid, info in clients.items():
+                    if cid == client_id or info.get('client_name', '').lower() == client_id.lower():
+                        client_name_for_db = info.get('client_name', client_id).lower()
+                        break
+            except Exception:
+                pass
 
-                if not row or not row[0]:
+            # Check when logs were last updated (check log_entries table, not old logs table)
+            async with get_db() as db:
+                cursor = await db.execute('''
+                    SELECT MAX(log_timestamp) as last_event_time
+                    FROM log_entries
+                    WHERE client_id = %s
+                ''', (client_name_for_db,))
+                row = await db.fetchone(cursor)
+
+                if not row or not row.get('last_event_time'):
                     # No logs found - need to fetch
                     logger.info(f"No logs found for {client_id}, requesting fresh logs...")
                     await self.request_client_logs(client_id, days=7)  # Default to 7 days
                     return {"fresh": False, "age_hours": None, "refreshed": True}
 
-                last_log_time = datetime.fromisoformat(row[0])
-                age = datetime.now() - last_log_time
+                # Parse the log timestamp (actual firewall event time)
+                last_event_time_str = row.get('last_event_time')
+                try:
+                    # Handle ISO format with or without timezone
+                    if isinstance(last_event_time_str, str):
+                        last_event_time = datetime.fromisoformat(last_event_time_str.replace('Z', '+00:00'))
+                    else:
+                        # PostgreSQL returns datetime object directly
+                        last_event_time = last_event_time_str
+
+                    if last_event_time.tzinfo:
+                        now = datetime.now(last_event_time.tzinfo)
+                    else:
+                        now = datetime.now()
+                        last_event_time = last_event_time.replace(tzinfo=None)
+                except:
+                    # Fallback: assume naive datetime
+                    if isinstance(last_event_time_str, str):
+                        last_event_time = datetime.fromisoformat(last_event_time_str)
+                    else:
+                        last_event_time = last_event_time_str
+                    now = datetime.now()
+
+                age = now - last_event_time
                 age_hours = age.total_seconds() / 3600
 
                 if age_hours > max_age_hours:
@@ -1219,7 +1257,7 @@ class AICommandCenter:
                     await self.request_client_logs(client_id, days=7)  # Default to 7 days
                     return {"fresh": False, "age_hours": age_hours, "refreshed": True}
 
-                logger.info(f"Logs for {client_id} are fresh ({age_hours:.1f} hours old)")
+                logger.info(f"✅ Logs for {client_id} are fresh ({age_hours:.1f} hours old, max: {max_age_hours}h) - skipping download")
                 return {"fresh": True, "age_hours": age_hours, "refreshed": False}
 
         except Exception as e:
@@ -1243,6 +1281,7 @@ class AICommandCenter:
 
             # Map provided name -> actual ID as needed
             actual_client_id = client_id
+            client_name_for_db = client_id.lower()  # Default to lowercase input
             try:
                 res = requests.get(f"{self.hq_url}/clients", timeout=30)
                 res.raise_for_status()
@@ -1250,6 +1289,11 @@ class AICommandCenter:
                 name_to_id = {v.get('client_name', ''): k for k, v in clients.items()}
                 if client_id in name_to_id:
                     actual_client_id = name_to_id[client_id]
+                # Get the client_name for database queries (logs are stored by client_name, not hash)
+                for cid, info in clients.items():
+                    if cid == actual_client_id or info.get('client_name', '').lower() == client_id.lower():
+                        client_name_for_db = info.get('client_name', client_id).lower()
+                        break
             except Exception:
                 pass
 
@@ -1264,7 +1308,9 @@ class AICommandCenter:
             effective_days = days if isinstance(days, int) and days > 0 else self.last_logs_request_days.get(client_id, 7)
             effective_top_n = top_n if isinstance(top_n, int) and top_n > 0 else 10
 
-            lqe = LogQueryEngine.from_db(self.db_path, actual_client_id, since_days=effective_days)
+            # Use sampling for performance with large log datasets
+            # Note: Logs are stored by client_name (lowercase), not client_id hash
+            lqe = LogQueryEngine.from_db(self.db_path, client_name_for_db, since_days=effective_days, sample_rate=5)
 
             def compact(entries: List[Any]) -> List[Dict[str, Any]]:
                 out = []
@@ -1549,8 +1595,8 @@ class AICommandCenter:
             except Exception:
                 pass
 
-            # Step 3: Ensure fresh logs (< 6 hours old) before running analysis
-            freshness = await self._ensure_fresh_logs(actual_client_id, max_age_hours=6)
+            # Step 3: Ensure fresh logs (< 1 hour old) before running analysis
+            freshness = await self._ensure_fresh_logs(actual_client_id, max_age_hours=1)
             if force_refresh and not freshness.get('refreshed'):
                 # Force refresh even if logs are fresh
                 log_req = await self.request_client_logs(client_id, days)
@@ -1560,10 +1606,35 @@ class AICommandCenter:
 
             # Wait for logs to be ingested if we just refreshed
             if freshness.get('refreshed'):
-                await asyncio.sleep(2)
+                # Wait for the log ingestion command to complete (not just 2 seconds)
+                # The command_id should be available from _ensure_fresh_logs
+                print("⏳ Waiting for log ingestion to complete...")
+                max_wait = 300  # 5 minutes max
+                wait_start = time.time()
+                while time.time() - wait_start < max_wait:
+                    try:
+                        # Check if any get_logs command for this client is still in progress
+                        async with get_db() as db:
+                            cur = await db.execute('''
+                                SELECT COUNT(*) FROM commands
+                                WHERE client_id = %s
+                                AND command_type = %s
+                                AND status = %s
+                            ''', (actual_client_id, 'get_logs', 'in_progress'))
+                            row = await db.fetchone(cur)
+                            in_progress = row.get('count', 0) if row else 0
+
+                            if in_progress == 0:
+                                print("✅ Log ingestion complete")
+                                break
+
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        print(f"⚠️  Error checking ingestion status: {e}")
+                        await asyncio.sleep(2)
 
             # Step 4: Query logs for risk indicators (auto_refresh=False since we already checked)
-            risk_query = await self.query_logs(client_id, 'summary', days=days, top_n=10, auto_refresh=False)
+            risk_query = await self.query_logs(client_id, 'risk assessment', days=days, top_n=10, auto_refresh=False)
             if not risk_query.get('success'):
                 return risk_query
 
@@ -1576,6 +1647,10 @@ class AICommandCenter:
             brute_force_count = results.get('potential_brute_force', {}).get('count', 0)
             top_blocked_ips = results.get('top_blocked_ips', [])
             risk_level = results.get('risk_level', 'Unknown')
+            scanning_activity = results.get('scanning_activity', {})
+            geographic_analysis = results.get('geographic_analysis', {})
+            threat_intelligence = results.get('threat_intelligence', {})
+            outbound_analysis = results.get('outbound_analysis', {})
 
             # Generate comprehensive findings
             key_findings = [
@@ -1584,8 +1659,50 @@ class AICommandCenter:
                 f"Risk level: {risk_level}"
             ]
 
+            # Show top 5 blocked IPs
             if top_blocked_ips:
-                key_findings.append(f"Top blocked IP: {top_blocked_ips[0][0]} ({top_blocked_ips[0][1]} blocks)")
+                key_findings.append(f"Top 5 blocked IPs:")
+                for i, (ip, count) in enumerate(top_blocked_ips[:5], 1):
+                    key_findings.append(f"  {i}. {ip}: {count:,} blocks")
+
+            # Show scanning activity
+            if scanning_activity:
+                vertical_scans = scanning_activity.get('total_vertical_scans', 0)
+                horizontal_scans = scanning_activity.get('total_horizontal_scans', 0)
+                if vertical_scans > 0 or horizontal_scans > 0:
+                    key_findings.append(f"Scanning activity detected:")
+                    if vertical_scans > 0:
+                        key_findings.append(f"  - {vertical_scans} vertical port scan(s)")
+                    if horizontal_scans > 0:
+                        key_findings.append(f"  - {horizontal_scans} network sweep(s)")
+
+            # Show geographic threats
+            if geographic_analysis and geographic_analysis.get('success'):
+                top_countries = geographic_analysis.get('top_source_countries', [])
+                if top_countries:
+                    key_findings.append(f"Top threat countries:")
+                    for i, country in enumerate(top_countries[:3], 1):
+                        key_findings.append(f"  {i}. {country['country_name']} ({country['country_code']}): {country['blocked_connections']} blocks")
+
+            # Show threat intelligence
+            if threat_intelligence and threat_intelligence.get('success'):
+                malicious_count = threat_intelligence.get('malicious_ips_detected', 0)
+                if malicious_count > 0:
+                    key_findings.append(f"⚠️ Known malicious IPs detected: {malicious_count}")
+                    threat_findings = threat_intelligence.get('threat_findings', [])
+                    if threat_findings:
+                        top_threat = threat_findings[0]
+                        key_findings.append(f"  Top threat: {top_threat['ip']} (Confidence: {top_threat['abuse_confidence_score']}%)")
+
+            # Show outbound anomalies
+            if outbound_analysis and outbound_analysis.get('success'):
+                suspicious_count = outbound_analysis.get('unique_internal_hosts_affected', 0)
+                if suspicious_count > 0:
+                    key_findings.append(f"🚨 CRITICAL: {suspicious_count} internal host(s) with suspicious outbound connections")
+                    suspicious_conns = outbound_analysis.get('suspicious_connections', [])
+                    if suspicious_conns:
+                        top_outbound = suspicious_conns[0]
+                        key_findings.append(f"  {top_outbound['source_ip']} → {top_outbound['destination_ip']}:{top_outbound['destination_port']}")
 
             # System health findings
             if isinstance(health_data, dict):
@@ -1639,27 +1756,32 @@ class AICommandCenter:
             except Exception:
                 pass
 
-            async with aiosqlite.connect(self.db_path) as db:
+            async with get_db() as db:
                 cursor = await db.execute("""
-                    SELECT timestamp, size_bytes, compressed, COUNT(*) as log_count
-                    FROM logs WHERE client_id = ?
-                    ORDER BY timestamp DESC LIMIT 1
+                    SELECT MAX(timestamp) as last_timestamp, COUNT(*) as log_count
+                    FROM log_entries WHERE client_id = %s
                 """, (actual_client_id,))
-                row = await cursor.fetchone()
+                row = await db.fetchone(cursor)
 
-                if not row or not row[0]:
+                if not row or not row.get('last_timestamp'):
                     return {'success': False, 'error': 'No logs found for client'}
 
-                ts, size, compressed, log_count = row
-                age_hours = (datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 3600
+                ts = row.get('last_timestamp')
+                log_count = row.get('log_count', 0)
+
+                # Handle datetime object from PostgreSQL
+                if isinstance(ts, datetime):
+                    age_hours = (datetime.now() - ts).total_seconds() / 3600
+                    ts_str = ts.isoformat()
+                else:
+                    age_hours = (datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 3600
+                    ts_str = ts
 
                 return {
                     'success': True,
                     'client_id': actual_client_id,
-                    'last_ingested': ts,
+                    'last_ingested': ts_str,
                     'age_hours': age_hours,
-                    'size_bytes': size,
-                    'compressed': bool(compressed),
                     'total_log_entries': log_count
                 }
         except Exception as e:
