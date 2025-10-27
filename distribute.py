@@ -8,12 +8,9 @@ import os
 import subprocess
 import sys
 import glob
-import getpass
 from datetime import datetime
 
 # Configuration
-PFSENSE_IP = "103.26.150.122"
-PFSENSE_USER = "root"
 DIST_DIR = "dist"
 BUNDLE_PREFIX = "pfsense-client-bundle"
 
@@ -61,7 +58,7 @@ def step1_make_bundle():
     print(f"✅ Bundle created: {bundle_file}")
     return bundle_file
 
-def step2_upload_files(bundle_file, password):
+def step2_upload_files(bundle_file, pfsense_ip, pfsense_user):
     """Step 2: Upload bundle and deployment script"""
     print("=" * 50)
     print("📤 Step 2: Uploading files to pfSense...")
@@ -168,7 +165,7 @@ rm -rf /tmp/pfsense-client-bundle
 
     # Upload bundle
     print(f"📤 Uploading bundle: {bundle_file}")
-    scp_cmd = f'scp "{bundle_file}" {PFSENSE_USER}@{PFSENSE_IP}:/tmp/pfsense-client-update.zip'
+    scp_cmd = f'scp "{bundle_file}" {pfsense_user}@{pfsense_ip}:/tmp/pfsense-client-update.zip'
 
     print(f"Running: {scp_cmd}")
     print("Enter password when prompted...")
@@ -181,7 +178,7 @@ rm -rf /tmp/pfsense-client-bundle
 
     # Upload deployment script
     print("📤 Uploading deployment script...")
-    scp_cmd2 = f'scp deploy_remote.sh {PFSENSE_USER}@{PFSENSE_IP}:/tmp/'
+    scp_cmd2 = f'scp deploy_remote.sh {pfsense_user}@{pfsense_ip}:/tmp/'
 
     print(f"Running: {scp_cmd2}")
     print("Enter password when prompted...")
@@ -191,25 +188,25 @@ rm -rf /tmp/pfsense-client-bundle
         if result:
             print(f"Error: {result.stderr}")
         return False
-    
+
     print("✅ Files uploaded successfully")
-    
+
     return True
 
-def step3_deploy(password):
+def step3_deploy(pfsense_ip, pfsense_user):
     """Step 3: SSH and execute deployment"""
     print("=" * 50)
     print("🚀 Step 3: Executing deployment on pfSense...")
     print("=" * 50)
-    
+
     # SSH and execute deployment
-    ssh_cmd = f'ssh {PFSENSE_USER}@{PFSENSE_IP} "if [ -f /tmp/deploy_remote.sh ]; then chmod +x /tmp/deploy_remote.sh && /tmp/deploy_remote.sh; else echo \"/tmp/deploy_remote.sh missing\"; exit 2; fi"'
+    ssh_cmd = f'ssh {pfsense_user}@{pfsense_ip} "if [ -f /tmp/deploy_remote.sh ]; then chmod +x /tmp/deploy_remote.sh && /tmp/deploy_remote.sh; else echo \"/tmp/deploy_remote.sh missing\"; exit 2; fi"'
 
     print("🔧 Executing deployment script...")
     print(f"Running: {ssh_cmd}")
     print("Enter password when prompted...")
     result = run_command(ssh_cmd, check=False)
-    
+
     if result and result.returncode == 0:
         print("✅ Deployment completed successfully!")
         # Cleanup local deployment script after success
@@ -228,27 +225,37 @@ def main():
     """Main distribution function"""
     print("🚀 pfSense WebSocket Client Auto-Distribution")
     print("=" * 50)
-    print(f"Target: {PFSENSE_USER}@{PFSENSE_IP}")
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    
-    # Get password
-    password = getpass.getpass(f"Enter password for {PFSENSE_USER}@{PFSENSE_IP}: ")
-    
+
+    # Get pfSense connection details
+    pfsense_ip = input("Enter pfSense IP address: ").strip()
+    if not pfsense_ip:
+        print("❌ IP address is required")
+        return 1
+
+    pfsense_user = input(f"Enter SSH username (default: root): ").strip() or "root"
+
+    print()
+    print(f"Target: {pfsense_user}@{pfsense_ip}")
+    print()
+    print("Note: You will be prompted for the SSH password 3 times (bundle upload, script upload, and deployment)")
+    print()
+
     try:
         # Step 1: Create bundle
         bundle_file = step1_make_bundle()
         if not bundle_file:
             return 1
-        
+
         # Step 2: Upload files
-        if not step2_upload_files(bundle_file, password):
+        if not step2_upload_files(bundle_file, pfsense_ip, pfsense_user):
             return 1
-        
+
         # Step 3: Deploy
-        if not step3_deploy(password):
+        if not step3_deploy(pfsense_ip, pfsense_user):
             return 1
-        
+
         print()
         print("=" * 50)
         print("🎉 DISTRIBUTION COMPLETE!")
@@ -256,14 +263,14 @@ def main():
         print()
         print("📋 Next steps:")
         print("1. Start your HQ server: start_hq_server.bat")
-        print("2. Monitor connection: ssh admin@103.26.150.122 'tail -f /var/log/pfsense_client.log'")
+        print(f"2. Monitor connection: ssh {pfsense_user}@{pfsense_ip} 'tail -f /var/log/pfsense_client.log'")
         print("3. Check server status: curl https://lnsfirewall.ngrok.app/status")
         print()
         print("🔌 Client should connect to: wss://lnsfirewall.ngrok.app/ws")
         print("🎯 Ready for WebSocket connection!")
-        
+
         return 0
-        
+
     except KeyboardInterrupt:
         print("\n❌ Distribution cancelled by user")
         return 1
