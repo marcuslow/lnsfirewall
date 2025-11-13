@@ -38,7 +38,6 @@ def create_deployment_package():
         "start_hq_server.bat",
         "setup_postgres_db.py",
         "README.md",
-        "README.START.md",  # Will be created separately
         "GeoLite2-Country.mmdb",  # Optional but useful
     ]
     
@@ -70,8 +69,15 @@ def create_deployment_package():
             print(f"📄 Copying file: {file_name}")
             shutil.copy2(file_name, dest)
         else:
-            if file_name != "README.START.md":  # We'll create this
-                print(f"⚠️  Warning: {file_name} not found, skipping")
+            print(f"⚠️  Warning: {file_name} not found, skipping")
+
+    # Copy README.START.md from documentation folder
+    if os.path.exists("documentation/README.START.md"):
+        dest = os.path.join(package_dir, "README.START.md")
+        print(f"📄 Copying file: documentation/README.START.md -> README.START.md")
+        shutil.copy2("documentation/README.START.md", dest)
+    else:
+        print(f"⚠️  Warning: documentation/README.START.md not found, skipping")
     
     # Copy optional files
     for file_name in optional_files:
