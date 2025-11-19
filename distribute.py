@@ -43,7 +43,9 @@ def step1_make_bundle():
     
     # Create new bundle
     print("🔨 Creating new bundle...")
-    result = run_command("make_client_bundle.bat")
+    # Use full path to batch file to ensure it runs from correct directory
+    batch_file = os.path.join(os.getcwd(), "make_client_bundle.bat")
+    result = run_command(batch_file)
     if not result:
         print("❌ Failed to create bundle")
         return None
