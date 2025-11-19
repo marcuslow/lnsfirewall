@@ -8,7 +8,6 @@ import os
 import subprocess
 import sys
 import glob
-import zipfile
 from datetime import datetime
 
 # Configuration
@@ -31,7 +30,7 @@ def step1_make_bundle():
     print("=" * 50)
     print("📦 Step 1: Creating new client bundle...")
     print("=" * 50)
-
+    
     # Clean old zip files
     print("🧹 Cleaning old bundle files...")
     old_zips = glob.glob(f"{DIST_DIR}/{BUNDLE_PREFIX}-*.zip")
@@ -41,41 +40,23 @@ def step1_make_bundle():
             print(f"   Deleted: {zip_file}")
         except Exception as e:
             print(f"   Warning: Could not delete {zip_file}: {e}")
-
-    # Create dist directory if it doesn't exist
-    os.makedirs(DIST_DIR, exist_ok=True)
-
-    # Create new bundle using Python zipfile
+    
+    # Create new bundle
     print("🔨 Creating new bundle...")
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    bundle_file = f"{DIST_DIR}/{BUNDLE_PREFIX}-{timestamp}.zip"
-
-    # Files to include in the bundle
-    files_to_bundle = [
-        ("client/pfsense_client.py", "client/pfsense_client.py"),
-        ("client/psutil_stub.py", "client/psutil_stub.py"),
-        ("config/client_config.yaml", "config/client_config.yaml"),
-        ("setup_client.sh", "setup_client.sh"),
-        ("restart_client.sh", "restart_client.sh"),
-    ]
-
-    try:
-        with zipfile.ZipFile(bundle_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for src, arcname in files_to_bundle:
-                if os.path.exists(src):
-                    zf.write(src, arcname)
-                    print(f"   Added: {arcname}")
-                else:
-                    print(f"   Warning: {src} not found, skipping")
-
-        print(f"✅ Bundle created: {bundle_file}")
-        return bundle_file
-
-    except Exception as e:
-        print(f"❌ Failed to create bundle: {e}")
-        import traceback
-        traceback.print_exc()
+    result = run_command("make_client_bundle.bat")
+    if not result:
+        print("❌ Failed to create bundle")
         return None
+    
+    # Find the new bundle file
+    new_zips = glob.glob(f"{DIST_DIR}/{BUNDLE_PREFIX}-*.zip")
+    if not new_zips:
+        print("❌ No bundle file found after creation")
+        return None
+    
+    bundle_file = new_zips[0]  # Should be only one after cleanup
+    print(f"✅ Bundle created: {bundle_file}")
+    return bundle_file
 
 def step2_upload_files(bundle_file, pfsense_ip, pfsense_user):
     """Step 2: Upload bundle and deployment script"""
