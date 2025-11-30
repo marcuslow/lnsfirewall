@@ -11,12 +11,16 @@ load_dotenv()
 
 # Import DeepAgents
 from deepagents import create_deep_agent
+from langchain_openai import ChatOpenAI
 
 # Import firewall tools
 from tools import FIREWALL_TOOLS
 
+# Create OpenAI model (uses OPENAI_API_KEY from .env)
+model = ChatOpenAI(model="gpt-4o", temperature=0)
+
 # System prompt for the firewall management agent
-SYSTEM_PROMPT = """You are DeepSense, an AI-powered firewall security analyst and manager.
+SYSTEM_PROMPT = """You are DeepSense, an AI-powered firewall security analyst and manager for pfsense.
 
 You help manage pfSense firewalls through a centralized HQ server. You can:
 
@@ -44,8 +48,9 @@ You help manage pfSense firewalls through a centralized HQ server. You can:
 You are connected to a live HQ server that manages multiple pfSense firewalls.
 """
 
-# Create the DeepAgents graph
+# Create the DeepAgents graph with OpenAI model
 graph = create_deep_agent(
+    model=model,
     tools=FIREWALL_TOOLS,
     system_prompt=SYSTEM_PROMPT,
 )

@@ -1,0 +1,114 @@
+DeepSense Firewall Console - How to Start
+==========================================
+
+ARCHITECTURE
+------------
+Web UI (React, port 5173)
+    |
+    v
+LangGraph Server (port 2024)
+    |
+    v (HTTP calls)
+HQ Server (port 8000)
+    |
+    v (WebSocket/HTTP)
+pfSense Clients
+
+
+PREREQUISITES
+-------------
+- Python 3.10+
+- Node.js 18+
+- PostgreSQL (for HQ server database)
+- OpenAI API key in .env file
+
+
+STEP 1: Install Python Dependencies
+------------------------------------
+pip install -r requirements.txt
+
+
+STEP 2: Install Web UI Dependencies
+-----------------------------------
+cd hq/web-ui
+npm install
+
+
+STEP 3: Configure Environment
+-----------------------------
+Copy .env.example to .env and set:
+- OPENAI_API_KEY=your_openai_api_key
+- HQ_URL=http://localhost:8000 (default)
+
+
+STEP 4: Start HQ Server (Terminal 1)
+------------------------------------
+python hq/http_server.py
+
+This starts the HQ server on port 8000 which:
+- Manages pfSense client connections
+- Stores rules and logs in PostgreSQL
+- Provides HTTP API for the AI agent
+
+
+STEP 5: Start LangGraph Agent (Terminal 2)
+------------------------------------------
+cd hq
+langgraph dev
+
+This starts the LangGraph agent server on port 2024 which:
+- Runs the DeepAgents AI agent
+- Processes natural language commands
+- Calls HQ server tools to manage firewalls
+
+
+STEP 6: Start Web UI (Terminal 3)
+---------------------------------
+cd hq/web-ui
+npm run dev
+
+This starts the React web UI on port 5173 which:
+- Provides chat interface for the AI agent
+- Streams responses from LangGraph server
+
+
+STEP 7: Open Browser
+--------------------
+Open http://localhost:5173
+
+You can now interact with the DeepSense Firewall Console.
+
+
+EXAMPLE COMMANDS
+----------------
+- "Show me all connected clients"
+- "Get system health for opus-1"
+- "Analyze blocked traffic for the last 7 days"
+- "Perform a security assessment on opus-1"
+- "What port forwarding rules are configured?"
+- "Query logs for blocked SSH attempts"
+
+
+FILES
+-----
+hq/agent.py          - DeepAgents agent definition
+hq/tools.py          - 13 firewall management tools
+hq/langgraph.json    - LangGraph configuration
+hq/http_server.py    - HQ server (client connections, DB)
+hq/web-ui/           - React web interface
+
+
+TROUBLESHOOTING
+---------------
+1. If LangGraph fails to start:
+   - Ensure deepagents package is installed
+   - Check OPENAI_API_KEY is set in .env
+
+2. If Web UI can't connect:
+   - Ensure LangGraph is running on port 2024
+   - Check browser console for CORS errors
+
+3. If tools return errors:
+   - Ensure HQ server is running on port 8000
+   - Check HQ_URL environment variable
+
